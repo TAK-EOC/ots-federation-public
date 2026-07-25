@@ -9,10 +9,22 @@ for each.
 
 | Peer | Version | Notes |
 |---|---|---|
-| **TAK Server** | `5.4-RELEASE-17` (official Docker distribution) | Federation protocol v2 (gRPC), stock `federation.jar` FIG negotiator |
+| **TAK Server** | `5.4-RELEASE-17` (official Docker distribution) | Federation protocol v2 (gRPC), stock `federation.jar` FIG negotiator, default port `9001` |
 | **OpenTAKServer** | `1.7.11` | via this plugin, OTS-to-OTS federation |
 | **taky** | `0.11.x` (federation-enabled build) | requires the federation feature flag enabled at build/config time |
 | **ATAK** | `5.6` | end-user client devices connecting to a federated server; federation is transparent to the client |
+
+All federation, regardless of peer type, negotiates over the **FIG (Federated
+Intel Gateway) v2 protocol** — a gRPC service, not the legacy v1 TCP/XML
+transport. `ots-federation`'s own listener defaults to TCP `9101`; stock TAK
+Server's federation input defaults to `9001`. Either side's port is
+configurable — match whatever the peer admin's config actually uses.
+
+**Stock TAK Server callers:** a `<federate>` entry with no `<inboundGroup>`
+and no `<outboundGroup>` negotiates the FIG handshake successfully but
+exchanges **zero traffic in either direction** — this fails silently (no
+error in the TAK Server log) and is the most common first-federation mistake.
+Add at least one of each before expecting any CoT to cross the link.
 
 ## Runtime
 
