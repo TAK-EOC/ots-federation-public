@@ -1,7 +1,7 @@
 # ots-federation
 
-TAK **federation v2** for [OpenTAKServer](https://github.com/brian7704/OpenTAKServer)
-Is a plugin that lets an OTS instance exchange CoT traffic
+TAK **federation v2** for [OpenTAKServer](https://github.com/brian7704/OpenTAKServer) —
+a plugin that lets an OTS instance exchange CoT traffic
 server-to-server with stock **TAK Server**, **taky**, and other OTS instances
 over the standard FIG v2 gRPC federation protocol.
 
