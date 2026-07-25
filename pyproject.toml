@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ots-federation"
+version = "0.1.21"
+description = "TAK federation v2 plugin for OpenTAKServer (FIG v2 gRPC, mutual-TLS, group-based access control)"
+readme = "README.md"
+authors = [{name = "takeoc", email = "takeoc@proton.me"}]
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    # OpenTAKServer dependency for plugin framework (ots_federation.plugin:FederationPlugin).
+    # Pin to v1.7.x; next major version (v2.x) may have breaking plugin API changes.
+    "opentakserver>=1.7,<2.0",
+    # Core CoT XML parsing — same version pin as taky-federation setup.py.
+    "lxml>=4.4.0",
+    # Date parsing for Event.from_elm.
+    "dateutils",
+    # Certificate generation (gen_fed_ca) and TLS validation (tls.py).
+    "cryptography>=38.0.0",
+    # gRPC FederatedChannel v2 transport.
+    # Pin rationale mirrors taky-federation setup.py [extras_require.federation]
+    #: zero open CVEs at these versions (2026-06-18).
+    "grpcio==1.81.1",
+    # OTS venv pins protobuf==6.33.1; allow any 6.x patch release so the wheel
+    # installs alongside OTS without version conflict.
+    "protobuf>=6.33.1,<7.0",
+    # RabbitMQ client for OtsRmqBus (firehose consumer + cot_parser publisher).
+    "pika>=1.3.0",
+    # APScheduler for FederationPlugin watchdog job (plugin.py).
+    "apscheduler>=3.10.0,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-timeout",
+]
+
+[project.entry-points."console_scripts"]
+# CLI tool for federation certificate generation (generate|export|apply
+# subcommands; bare invocation back-compat routes to generate — see
+# ots_federation/gen_fed_ca.py main()).
+ots-fed-certs = "ots_federation.gen_fed_ca:main"
+# Quick-start: wheel-installed OTS -> generated certs + minimal
+# federation.ini + peer-exchange bundle, in one idempotent step.
+ots-federation-quickstart = "ots_federation.quickstart:main"
+
+[project.entry-points."opentakserver.plugin"]
+# Registered under the opentakserver.plugin entry-point group so that OTS
+# PluginManager discovers FederationPlugin on startup.
+federation = "ots_federation.plugin:FederationPlugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ots_federation*"]
+
+[tool.setuptools.package-data]
+ots_federation = ["examples/*.ini"]
