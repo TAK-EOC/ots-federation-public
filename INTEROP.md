@@ -34,26 +34,35 @@ Add at least one of each before expecting any CoT to cross the link.
 | grpcio | 1.81.1 |
 | protobuf | 6.33.x |
 
-## What was verified
+## What was verified, and against which peer
 
-- **Bidirectional CoT event federation** — PLI, markers, and GeoChat
-  messages federate correctly in both directions between `ots-federation`
-  and each peer type listed above.
-- **Mutual-CA handshake with stock TAK Server**, including the
-  leaf+CA **chain certificate** TAK Server's FIG negotiator requires
-  (a bare leaf certificate is not sufficient against stock TAK Server;
-  the chain must be presented).
-- **Group mapping**, including the group-less case: stock TAK Server does
-  not annotate group membership on outbound federated events by default
-  (`federatedGroupMapping` disabled is the common configuration), so
-  `ots-federation`'s wildcard `accept_as` mapping (`*:<group>`) was
-  verified to accept these unannotated inbound events rather than
-  silently dropping them.
-- **Multi-peer link stability** — concurrent federation links to more
-  than one peer type held without cross-talk or link flapping.
-- **Loop prevention** — provenance tracking and hop-limit enforcement
-  were verified to stop a re-federated event from cycling back through
-  a link it already traversed, across a multi-server mesh.
+Coverage is not uniform across peers — stated per pairing rather than as a
+blanket claim:
+
+- **Control plane, OTS ↔ stock TAK Server 5.4**: proven. FIG v2 handshake
+  succeeds using the leaf+CA **chain certificate** TAK Server's negotiator
+  requires (a bare leaf certificate is not sufficient against stock TAK
+  Server).
+- **Data plane, OTS ↔ stock TAK Server 5.4**: all CoT payload classes this
+  plugin builds for — PLI, marker, route, CASEVAC/other, group-broadcast
+  chat, directed chat — confirmed in both directions, observed from the
+  receiving server's own event store (not a synthetic test client's
+  receipt; see the interop test plan for why that distinction matters).
+- **OTS ↔ taky (federation build)**: PLI confirmed via a real,
+  group-enrolled client over a sustained multi-day period. The other
+  payload classes travel the same encode/transport path but have not been
+  separately exercised against a taky peer the way they have against TAK
+  Server, so treat that coverage as narrower until it is.
+- **Group mapping**: the wildcard `accept_as = *:<group>` path was
+  verified against stock TAK Server, which by default does not annotate
+  group membership on outbound federated events (`federatedGroupMapping`
+  disabled is the common configuration) — the wildcard was confirmed to
+  accept these unannotated events rather than silently dropping them.
+
+Multi-peer link stability and loop prevention (provenance + hop limits) are
+exercised by this project's own unit test suite, not by the real-peer
+interop testing summarized above; they are not separately claimed as
+interop-verified here.
 
 ## What "verified" means here
 
@@ -67,7 +76,11 @@ itself, and it does not cover peer versions outside the table above.
 ## Known scope boundary
 
 `ots-federation` federates events between a server and its directly
-configured peers (direct link, both directions). Re-forwarding an event
-received from one peer out to a *different* peer ("hub" / transitive
-federation) is a distinct capability, controlled independently, and is
-outside the scope of what this document verifies.
+configured peers (direct link, both directions) — that is what this
+document verifies. Re-forwarding an event received from one peer out to a
+*different* peer ("hub" / transitive federation) is a distinct capability,
+gated by its own configuration flag, and is **not demonstrated working**.
+Current understanding is that it is blocked by a fail-closed
+group-membership cache lookup for uids that never had a local
+registration. If your deployment needs hub/passthrough, treat it as
+unverified and test it directly before relying on it.
