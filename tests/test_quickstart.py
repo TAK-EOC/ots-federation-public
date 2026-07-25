@@ -4,10 +4,10 @@
 # Follows the tmp_path-based cert/config test pattern used in
 # tests/test_federation_tls_config.py and tests/test_gen_fed_ca_cli.py.
 #
-# This dev venv does not have `opentakserver` installed (it is an OTS-venv-only
-# runtime dependency, not a dev/test dependency of this repo), so
-# _check_ots_environment() genuinely returns False here — that fact is used
-# directly by TestOtsEnvironmentCheck instead of being mocked. All other test
+# `opentakserver` is a hard dependency declared in pyproject.toml, so a
+# standard `pip install -e .[dev]` (as CI does) makes it importable in this
+# venv — TestOtsEnvironmentCheck simulates the *absent* case explicitly via
+# sys.modules patching rather than relying on venv state. All other test
 # classes patch _check_ots_environment to True to exercise the rest of the
 # workflow, matching what a real OTS venv (with opentakserver importable)
 # would see.
@@ -26,17 +26,21 @@ class TestOtsEnvironmentCheck(unittest.TestCase):
     hard dependency (opentakserver) isn't importable in this interpreter."""
 
     def test_check_ots_environment_false_when_opentakserver_absent(self):
-        # Genuinely true in this dev venv (opentakserver is an OTS-venv-only
-        # runtime dep) — no mocking needed for this assertion.
-        self.assertFalse(quickstart._check_ots_environment())
+        # Setting the module to None in sys.modules forces the next
+        # `import opentakserver` to raise ImportError, simulating an
+        # environment where the hard dependency isn't resolvable —
+        # independent of whether this venv actually has it installed.
+        with mock.patch.dict("sys.modules", {"opentakserver": None}):
+            self.assertFalse(quickstart._check_ots_environment())
 
     def test_main_exits_nonzero_and_prints_pip_line_when_env_check_fails(self):
         import contextlib
         import io
 
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            ret = quickstart.main(["--cert-dir", "/nonexistent/should-not-be-touched"])
+        with mock.patch.dict("sys.modules", {"opentakserver": None}):
+            with contextlib.redirect_stderr(stderr):
+                ret = quickstart.main(["--cert-dir", "/nonexistent/should-not-be-touched"])
         self.assertEqual(ret, 1)
         output = stderr.getvalue()
         self.assertIn("opentakserver", output)
