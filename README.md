@@ -105,6 +105,13 @@ forwarded. A wildcard (`*:<group>`) is required to accept events from peers
 that do not annotate group membership on the wire (stock TAK Server with
 `federatedGroupMapping` disabled — the default — never annotates).
 
+## Interoperability & testing
+
+See [`INTEROP.md`](INTEROP.md) for the specific peer versions verified
+against, and [`docs/interop-test-plan.md`](docs/interop-test-plan.md) for
+the interop test methodology (scenario matrix, payload types, direction
+coverage, group-policy cases, link-stability checks).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
