@@ -74,12 +74,17 @@ Run each payload type in each enabled direction for each server pair:
 | 2 | marker | `a-u-G` | point marker |
 | 3 | route | `b-m-r` | route/line |
 | 4 | other / CASEVAC | `b-r-f-h-c` | represents the "other" detail-heavy CoT class |
-| 5 | group broadcast chat | `b-t-f` | GeoChat, broadcast |
-| 6 | directed chat (DM) | `b-t-f` | GeoChat, directed |
+| 5 | group broadcast chat | `b-t-f` | GeoChat, broadcast — verify it is not also delivered as a directed message |
+| 6 | directed chat (DM) | `b-t-f` | GeoChat, directed — verify it is not also delivered as a broadcast |
+| 7 | delete (stale-forced) | — | not a distinct CoT type — the *same* event re-sent with a near-future `stale` timestamp. Confirm the peer actually expires/removes the entity rather than treating the resend as a no-op update |
+| 8 | keepalive / refresh | — | a periodic re-send with an extended `stale` keeps the entity alive on the peer rather than letting it silently expire out from under a still-active track |
 
 Directions run **both ways** for every enabled server pair — a payload
 verified `server-a → server-b` is not assumed to also work
-`server-b → server-a`; test it explicitly.
+`server-b → server-a`; test it explicitly. Creation events alone are not
+sufficient coverage: delete and keepalive/refresh semantics are where
+real peer implementations most commonly diverge, because they're easy to
+get right for the happy path and easy to get wrong for the rest.
 
 ## Two capability classes — keep them separate
 
@@ -90,12 +95,20 @@ clients through the normal local-delivery group mechanism.
 
 **Class B — hub / passthrough** (peer A → your server → peer B).
 Re-forwarding an event that arrived *from* one peer back out to a
-*different* peer. This is a distinct capability from Class A, gated by
-its own configuration switch, and has its own failure modes around group
-cache population for non-local UIDs. Treat "hub" as a topology/trust
-decision (transitive federation exposes peer A's traffic to peer B) —
-confirm it is an intentional design choice before enabling it, and test
-it as a separate scenario from Class A.
+*different* peer — transitive federation. This is a materially different
+capability from Class A: it changes your trust model (you are now
+vouching for traffic you didn't originate to a third party), which is why
+most federation stacks disable it by default (in `ots-federation`, the
+`inject_cot_parser` config flag; default `false` = no passthrough).
+Confirm enabling it is an intentional design choice before testing it,
+and test it as its own scenario — don't assume a working direct link
+implies working passthrough. One implementation nuance worth checking
+explicitly: passthrough delivery depends on a per-EUD group-membership
+cache being populated for the federated event's originating uid. A uid
+that only ever arrived *from* federation, and was never a locally
+registered end-user device, can miss that cache and be silently dropped
+even with passthrough enabled — the cache-miss is fail-closed by design,
+so this shows up as "nothing happens," not an error.
 
 ## Group-policy test cases
 
