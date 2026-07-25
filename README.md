@@ -1,7 +1,7 @@
 # ots-federation
 
-TAK **federation v2** for [OpenTAKServer](https://github.com/brian7704/OpenTAKServer) —
-a plugin that lets an OTS instance exchange CoT (Cursor on Target) traffic
+TAK **federation v2** for [OpenTAKServer](https://github.com/brian7704/OpenTAKServer)
+Is a plugin that lets an OTS instance exchange CoT traffic
 server-to-server with stock **TAK Server**, **taky**, and other OTS instances
 over the standard FIG v2 gRPC federation protocol.
 
@@ -102,8 +102,7 @@ share_as = FedOut:FedOut
 
 Group policy is fail-closed: events that match no mapping are dropped, not
 forwarded. A wildcard (`*:<group>`) is required to accept events from peers
-that do not annotate group membership on the wire (stock TAK Server with
-`federatedGroupMapping` disabled — the default — never annotates).
+that do not annotate group membership on the wire.
 
 ## Interoperability & testing
 
