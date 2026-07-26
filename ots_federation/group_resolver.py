@@ -27,6 +27,21 @@ _QUERY = (
     "WHERE e.uid = %s"
 )
 
+# callsign -> OUT ACL group names. euds.callsign is unique-indexed in OTS.
+# Same query shape and same direction as _QUERY, keyed by callsign instead of
+# uid — used for the directed-message (marti) reachability check: a
+# federated event addressed to <dest callsign="..."/> must resolve the
+# DESTINATION's groups before delivery, mirroring the reference server's
+# mandatory group-reachability gate for directed events.
+_QUERY_BY_CALLSIGN = (
+    "SELECT g.name "
+    "FROM euds e "
+    "JOIN groups_users gu "
+    "  ON gu.user_id = e.user_id AND gu.direction = 'OUT' AND gu.enabled = true "
+    "JOIN groups g ON g.id = gu.group_id "
+    "WHERE e.callsign = %s"
+)
+
 
 class GroupResolveError(Exception):
     """Raised when the DB is unavailable — caller MUST fail closed (drop)."""
@@ -63,22 +78,22 @@ class GroupResolver:
         dsn = self._dburi.replace("postgresql+psycopg://", "postgresql://", 1)
         self._conn = psycopg.connect(dsn, autocommit=True, connect_timeout=5)
 
-    def resolve(self, uid: str) -> FrozenSet[str]:
-        """Return the EUD's OUT ACL groups. Raises GroupResolveError on DB failure."""
+    def _run_query(self, query: str, key: str) -> FrozenSet[str]:
+        """Shared retry/reconnect logic for both key-column variants."""
         for attempt in (1, 2):  # one reconnect retry on a dropped connection
             try:
                 if self._conn is None or self._conn.closed:
                     self._connect()
                 with self._conn.cursor() as cur:
-                    cur.execute(_QUERY, (uid,))
+                    cur.execute(query, (key,))
                     rows = cur.fetchall()
                 return frozenset(r[0] for r in rows)
             except GroupResolveError:
                 raise
             except Exception as exc:  # noqa: BLE001 — any driver/conn error -> fail closed
                 log.warning(
-                    "group_resolver: DB lookup for uid=%s failed (attempt %d): %s",
-                    uid, attempt, exc,
+                    "group_resolver: DB lookup for %r failed (attempt %d): %s",
+                    key, attempt, exc,
                 )
                 try:
                     if self._conn is not None:
@@ -88,6 +103,23 @@ class GroupResolver:
                 if attempt == 2:
                     raise GroupResolveError(str(exc)) from exc
         raise GroupResolveError("unreachable")  # pragma: no cover
+
+    def resolve(self, uid: str) -> FrozenSet[str]:
+        """Return the EUD's OUT ACL groups. Raises GroupResolveError on DB failure."""
+        return self._run_query(_QUERY, uid)
+
+    def resolve_by_callsign(self, callsign: str) -> FrozenSet[str]:
+        """
+        Return the OUT ACL groups of the EUD registered under *callsign*.
+
+        Used by the directed-message (marti) ACL gate (ots_bus.py inject()):
+        a federated inbound event addressed to a callsign must be checked
+        for group reachability before delivery, the same fail-closed
+        contract as resolve() — raises GroupResolveError on DB failure;
+        returns an empty frozenset (not an error) when the callsign is
+        genuinely unknown or has no OUT groups.
+        """
+        return self._run_query(_QUERY_BY_CALLSIGN, callsign)
 
     def close(self):
         if self._conn is not None:

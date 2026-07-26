@@ -419,19 +419,39 @@ class OtsRmqBus:
                     _detail = evt.detail
                     if _detail is not None and getattr(_detail, "has_marti", False):
                         # --- Marti-addressed: dms exchange, per callsign ---
+                        # Directed addressing selects a CANDIDATE destination;
+                        # group reachability decides whether it is actually
+                        # delivered — the same two-step check the group-fanout
+                        # branch gets from being keyed on local_groups in the
+                        # first place. Without this gate, a peer admitted to
+                        # ONE local group could message any callsign on the
+                        # server by name, regardless of which group that
+                        # callsign belongs to — addressing would silently
+                        # override the ACL the peer was actually admitted
+                        # under. Mirrors the reference server's mandatory
+                        # reachability check for directed events.
                         body_dms = json.dumps({"uid": evt.uid, "cot": cot_xml})
                         for callsign in _detail.marti_cs:
-                            if callsign:
-                                self._pub_ch.basic_publish(
-                                    exchange=_EXCHANGE_DMS,
-                                    routing_key=callsign,
-                                    body=body_dms,
-                                )
+                            if not callsign:
+                                continue
+                            if not self._dm_reachable(callsign, local_groups):
                                 log.debug(
-                                    "ots_bus.inject: published uid=%s to dms/%s "
-                                    "(marti-addressed directed delivery)",
-                                    evt.uid, callsign,
+                                    "ots_bus.inject: dropping directed event "
+                                    "uid=%s to callsign=%s (not reachable from "
+                                    "sender groups=%s)",
+                                    evt.uid, callsign, sorted(local_groups),
                                 )
+                                continue
+                            self._pub_ch.basic_publish(
+                                exchange=_EXCHANGE_DMS,
+                                routing_key=callsign,
+                                body=body_dms,
+                            )
+                            log.debug(
+                                "ots_bus.inject: published uid=%s to dms/%s "
+                                "(marti-addressed directed delivery)",
+                                evt.uid, callsign,
+                            )
                     else:
                         # --- Non-marti: groups exchange delivery ---
                         # Publish once per mapped local group so SSL-grouped EUDs
@@ -499,6 +519,43 @@ class OtsRmqBus:
                         )
                         if self._stop_event is not None:
                             self._stop_event.set()
+
+    def _dm_reachable(self, callsign: str, local_groups: FrozenSet[str]) -> bool:
+        """
+        Fail-closed group-reachability check for a directed (marti) destination.
+
+        Resolves *callsign*'s OUT ACL groups (synchronously, via the same
+        authoritative group_resolver the outbound firehose path uses — no
+        separate cache exists keyed by callsign) and returns True only when
+        that set intersects *local_groups* (the groups the sending peer was
+        already admitted into by inbound group policy). Any failure to
+        establish reachability — no resolver configured, or the DB
+        unreachable — returns False (drop), logged at debug so an operator
+        can distinguish "blocked because out of group" from "blocked because
+        reachability could not be checked".
+
+        Parameters
+        ----------
+        callsign : str
+            Destination callsign from <marti><dest callsign="..."/></marti>.
+        local_groups : frozenset[str]
+            The sending peer's mapped local ACL groups for this event.
+        """
+        if self._group_resolver is None:
+            log.debug(
+                "ots_bus: no group resolver configured — cannot verify DM "
+                "reachability for callsign=%s, failing closed", callsign,
+            )
+            return False
+        try:
+            dest_groups = self._group_resolver.resolve_by_callsign(callsign)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.debug(
+                "ots_bus: group resolve for callsign=%s failed — failing "
+                "closed: %s", callsign, exc,
+            )
+            return False
+        return bool(dest_groups & local_groups)
 
     # ------------------------------------------------------------------
     # Groups exchange subscriber (Option D)

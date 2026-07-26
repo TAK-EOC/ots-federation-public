@@ -63,6 +63,34 @@ def _build_ots_version() -> "fig_pb2.TakServerVersion":
 _COT_DELETE_TYPE_PREFIX = "t-x-d-d"
 
 
+class PeerIdentityMismatchError(RuntimeError):
+    """
+    Raised when the dialed server's cryptographic identity cannot be
+    established and resolved to a configured peer: the TLS certificate the
+    dialed host actually presented during the handshake is unobservable,
+    ambiguous, or its SHA-256 fingerprint is not registered for any
+    configured peer — or, as defense-in-depth, the wire getIdentity().serverId
+    contradicts an explicitly configured expected server_id.
+
+    Mirrors TAK Server's outbound semantics (TakFigClient.java:1268-1311)
+    and this codebase's own inbound identity check (fed_server.py):
+    group policy is keyed EXCLUSIVELY on the fingerprint of the certificate
+    presented on the mTLS transport, resolved through the same per-peer
+    `fingerprint` table as inbound. The wire-reported serverId NEVER selects
+    policy — a compromised host, or one reached via DNS/BGP hijack of the
+    configured address, holds at best its own valid fed-CA certificate,
+    whose fingerprint resolves (only) to its own configured policy or to
+    nothing at all. There is no fallthrough to the dialed stanza's policy,
+    no trust-on-first-use, and no opt-in escape hatch: an unrecognized
+    fingerprint is refused unconditionally until the operator configures it.
+
+    run_grpc_thread's generic exception handler catches this and reconnects
+    on the normal back-off schedule; that is the intended response — an
+    unverifiable peer gets nothing, repeatedly, not a one-time warning
+    followed by trust.
+    """
+
+
 class PeerState(enum.Enum):
     """
     Lifecycle state for a single federate peer.
@@ -81,6 +109,11 @@ class PeerState(enum.Enum):
 # Reconnect back-off: base=30s, cap=300s (5 min).
 _RECONNECT_BASE = 30.0
 _RECONNECT_CAP = 300.0
+
+# How long to wait for the TLS transport to reach READY before observing the
+# dialed server's presented certificate. Connection failures surface as
+# grpc.FutureTimeoutError and take the normal reconnect back-off path.
+_CHANNEL_READY_TIMEOUT = 30.0
 
 
 class FederateClient:
@@ -120,7 +153,7 @@ class FederateClient:
     """
 
     def __init__(self, peer_name, peer_config, node_id, bridge, group_registry=None,
-                 allow_federated_delete=False):
+                 allow_federated_delete=False, local_max_hops=3):
         self.peer_name = peer_name
         self.peer_config = peer_config
         self.node_id = node_id
@@ -128,13 +161,32 @@ class FederateClient:
         self.group_registry = group_registry
         # When False (default), inbound DELETE events are dropped..
         self.allow_federated_delete = allow_federated_delete
+        # This node's configured hop ceiling ([federation] max_hops), used to
+        # clamp an absent/zero/negative wire max_hops on INBOUND decode so a
+        # peer cannot obtain unlimited relay by omitting the field
+        # (hop-clamp fix). Distinct from peer_config.max_hops,
+        # which stamps OUR OWN outbound budget when relaying — a per-peer
+        # operator choice that may legitimately be unlimited (-1) for a
+        # trusted peer even when the inbound ceiling is not.
+        self.local_max_hops = local_max_hops
 
         # user=None: interface compatibility with FederationManager.on_outbound
         # which reads src.user to identify the source (a federate peer has no
         # local user object).
         self.user = None
 
+        # POLICY identity of the dialed peer (the key every group-policy
+        # lookup for this session uses). With a group registry present this
+        # is bound EXCLUSIVELY from the dialed server's presented TLS
+        # certificate fingerprint resolved through the registry's per-peer
+        # fingerprint table — never from the wire-reported
+        # getIdentity().serverId. Only in legacy no-registry mode (no group
+        # policy exists at all) does it fall back to the wire-reported value,
+        # for display/echo-skip purposes only.
         self._remote_server_id = None
+        # The serverId the remote REPORTED over getIdentity(). Logging and
+        # defense-in-depth cross-check only — never a policy key.
+        self._reported_server_id = None
         self._state = PeerState.DISABLED
         self._state_lock = threading.Lock()
 
@@ -152,7 +204,13 @@ class FederateClient:
 
     @property
     def remote_server_id(self):
-        """The remote peer's federation server ID from getIdentity(). None until ACTIVE."""
+        """The dialed peer's identity key. None until the handshake binds it.
+
+        With a group registry: the policy key resolved from the peer's
+        authenticated certificate fingerprint, NOT the
+        wire-reported getIdentity().serverId. Without a registry (legacy,
+        group policy disabled): the wire-reported serverId, display only.
+        """
         return self._remote_server_id
 
     @property
@@ -257,6 +315,7 @@ class FederateClient:
 
             self._set_state(PeerState.RECONNECTING)
             self._remote_server_id = None
+            self._reported_server_id = None
             self._stop_event.wait(timeout=reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, _RECONNECT_CAP)
 
@@ -315,26 +374,84 @@ class FederateClient:
                 ("grpc.keepalive_timeout_ms", 10000),
                 ("grpc.keepalive_permit_without_calls", 1),
                 ("grpc.http2.max_pings_without_data", 0),
+                # Channelz is how this client observes the certificate the
+                # dialed server actually presented on the live TLS transport
+                # (see cert_identity.observed_server_cert_fingerprints_for_target
+                # for why this mechanism and not auth_context / a verify
+                # callback).
+                ("grpc.enable_channelz", 1),
             ],
         ) as channel:
             stub = fig_pb2_grpc.FederatedChannelStub(channel)
             self._set_state(PeerState.HANDSHAKING)
 
-            # Step 2: getIdentity — record remote server ID..
+            # Step 1: bind this session's POLICY identity from the dialed
+            # server's presented TLS certificate — BEFORE any application
+            # RPC is issued, mirroring TAK Server, whose outbound federate
+            # resolution runs inside the TLS protocol negotiator
+            # (TakFigClient.java:1268-1311) and never consults the wire
+            # identity. The certificate fingerprint is looked up against the
+            # SAME per-peer `fingerprint` table the inbound path uses
+            # (groups.py resolve_peer_id_by_fingerprint).
+            # Unconfigured / unobservable / ambiguous ⇒
+            # PeerIdentityMismatchError ⇒ session refused, reconnect
+            # back-off. UNCONDITIONAL: there is no config shape that skips
+            # this when a group registry exists (the prior server_id-gated
+            # attempt was rejected precisely because server_id defaults
+            # empty).
+            verified_fp = None
+            if self.group_registry is not None:
+                self._wait_channel_ready(channel)
+                verified_fp, policy_peer_id = self._resolve_dialed_cert_identity(
+                    address
+                )
+                self._remote_server_id = policy_peer_id
+                self.lgr.info(
+                    "Peer %s: dialed server cert fingerprint verified; "
+                    "session policy identity = %r",
+                    self.peer_name, policy_peer_id,
+                )
+
+            # Step 2: getIdentity — protocol handshake step. The response's
+            # serverId is fully remote-controlled and is recorded for
+            # logging only; it NEVER selects policy (that happened above,
+            # from the certificate).
             identity_resp = stub.getIdentity(fig_pb2.Empty())
-            real_server_id = identity_resp.serverId
-            self._remote_server_id = real_server_id
+            reported_server_id = identity_resp.serverId
+            self._reported_server_id = reported_server_id
             self.lgr.info(
-                "Peer %s identified as serverId=%s (%s)",
-                self.peer_name,
-                self._remote_server_id,
-                identity_resp.name,
+                "Peer %s reports serverId=%s (%s)",
+                self.peer_name, reported_server_id, identity_resp.name,
             )
 
-            # Fix address:port → real server_id key mismatch in group registry.
-            if self.group_registry is not None:
-                provisional_id = f"{self.peer_config.address}:{self.peer_config.port}"
-                self.group_registry.rekey_peer(provisional_id, real_server_id)
+            # Defense-in-depth (NOT the primary control): when the operator
+            # additionally declared the peer's expected server_id, a
+            # contradicting wire report is a strong signal of a broken or
+            # hostile peer — refuse. This check can only ever refuse more;
+            # it never grants anything, and its absence (server_id unset,
+            # the default) changes nothing about the certificate binding
+            # above.
+            expected_server_id = getattr(self.peer_config, "server_id", "") or ""
+            if expected_server_id and reported_server_id != expected_server_id:
+                self.lgr.warning(
+                    "Peer %s: getIdentity() returned serverId=%r but this "
+                    "peer is configured as server_id=%r — refusing session "
+                    "(defense-in-depth; policy identity was already bound "
+                    "from the certificate and is not affected by wire "
+                    "claims).",
+                    self.peer_name, reported_server_id, expected_server_id,
+                )
+                raise PeerIdentityMismatchError(
+                    f"peer {self.peer_name!r}: getIdentity() serverId="
+                    f"{reported_server_id!r} does not match configured "
+                    f"server_id={expected_server_id!r}"
+                )
+
+            if self.group_registry is None:
+                # Legacy mode: no group policy exists anywhere, so there is
+                # no policy to steal; the wire-reported id is used for
+                # display / echo-skip only.
+                self._remote_server_id = reported_server_id
 
             sub = self._build_subscription()
 
@@ -344,10 +461,144 @@ class FederateClient:
             # Step 4: ClientFederateGroupsStream — announce our groups to peer.
             groups_send_future = self._open_client_groups_stream(stub)
 
+            # Step 4b: re-verify the transport certificate now that all
+            # session RPCs are bound. Closes the (exotic) window where the
+            # channel transparently reconnects between the pre-RPC check and
+            # stream establishment: any transport now carrying this
+            # session's RPCs must still present the verified certificate,
+            # or the session is torn down before going ACTIVE.
+            if verified_fp is not None:
+                self._recheck_dialed_cert(address, verified_fp)
+
             self._set_state(PeerState.ACTIVE)
 
             # Steps 5–7: receive events + groups from peer + health checks.
             self._run_event_loop(stub, sub, server_event_future, groups_send_future)
+
+    def _wait_channel_ready(self, channel):
+        """Block until the channel's transport is READY (or raise on timeout).
+
+        Split out so unit tests can stub the wait; connection failures raise
+        grpc.FutureTimeoutError into run_grpc_thread's reconnect path.
+        Polled in short slices so request_stop() interrupts the wait promptly
+        (a bare future.result(timeout=30) would pin the thread through
+        shutdown and stall FederationManager.stop()'s bounded joins).
+        """
+        ready_future = grpc.channel_ready_future(channel)
+        deadline = time.monotonic() + _CHANNEL_READY_TIMEOUT
+        while True:
+            if self._stop_event.is_set():
+                ready_future.cancel()
+                raise grpc.FutureTimeoutError(
+                    "stop requested while waiting for channel readiness"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                ready_future.cancel()
+                raise grpc.FutureTimeoutError(
+                    f"channel to {self.peer_name} not ready within "
+                    f"{_CHANNEL_READY_TIMEOUT:.0f}s"
+                )
+            try:
+                ready_future.result(timeout=min(0.5, remaining))
+                return
+            except grpc.FutureTimeoutError:
+                continue
+
+    def _observe_dialed_fingerprints(self, address):
+        """Observed cert fingerprints on live transports to *address*.
+
+        Thin wrapper over cert_identity's channelz observation so unit tests
+        can stub the observation without touching real channelz state.
+        """
+        from ots_federation.cert_identity import (  # pylint: disable=import-outside-toplevel
+            observed_server_cert_fingerprints_for_target,
+        )
+        return observed_server_cert_fingerprints_for_target(address)
+
+    def _resolve_dialed_cert_identity(self, address):
+        """
+        Resolve this session's policy identity from the dialed server's
+        presented TLS certificate.
+
+        Returns (fingerprint, policy_peer_id) on success. Raises
+        PeerIdentityMismatchError when the certificate is unobservable,
+        ambiguous (more than one distinct certificate on live transports to
+        this target), or its fingerprint is not registered for any
+        configured peer. Never falls through to the dialed stanza's policy,
+        a default policy, or anything wire-reported.
+        """
+        fingerprints = self._observe_dialed_fingerprints(address)
+
+        if not fingerprints:
+            self.lgr.warning(
+                "Peer %s: could not observe the dialed server's TLS "
+                "certificate on the transport to %s (insecure channel, or "
+                "channelz observation unavailable) — refusing session. "
+                "Group policy requires an mTLS transport whose server "
+                "certificate fingerprint is configured for a peer.",
+                self.peer_name, address,
+            )
+            raise PeerIdentityMismatchError(
+                f"peer {self.peer_name!r}: no server certificate observable "
+                f"on transport to {address!r}; cannot bind policy identity"
+            )
+
+        if len(fingerprints) > 1:
+            self.lgr.warning(
+                "Peer %s: multiple distinct server certificates observed on "
+                "live transports to %s (%s) — ambiguous identity, refusing "
+                "session.",
+                self.peer_name, address, sorted(fingerprints),
+            )
+            raise PeerIdentityMismatchError(
+                f"peer {self.peer_name!r}: ambiguous server certificate on "
+                f"transport to {address!r}"
+            )
+
+        (fingerprint,) = fingerprints
+        policy_peer_id = self.group_registry.resolve_peer_id_by_fingerprint(
+            fingerprint
+        )
+        if policy_peer_id is None:
+            # Unrecognized certificate: exactly TAK Server's "fresh, no
+            # inherited privilege" outcome, realized as refusal — an
+            # outbound session with an empty policy could still reach the
+            # [federation]-level default maps through map_inbound/
+            # map_outbound's default fallthrough, so no synthetic identity
+            # is created at all. The observed fingerprint is logged so the
+            # operator can add `fingerprint = <value>` to the intended
+            # peer's [federate:*] stanza (quarantine-until-configured, the
+            # same breaking tightening as the inbound fix).
+            self.lgr.warning(
+                "Peer %s: dialed server at %s presented certificate with "
+                "fingerprint %s, which is not configured for ANY peer — "
+                "refusing session (no policy granted, regardless of any "
+                "serverId the host reports). If this is the intended peer, "
+                "add `fingerprint = %s` to its [federate:*] section.",
+                self.peer_name, address, fingerprint, fingerprint,
+            )
+            raise PeerIdentityMismatchError(
+                f"peer {self.peer_name!r}: dialed server's certificate "
+                f"fingerprint {fingerprint} is not configured for any peer"
+            )
+
+        return fingerprint, policy_peer_id
+
+    def _recheck_dialed_cert(self, address, verified_fp):
+        """Require every live transport to *address* to still present the
+        verified certificate; raise PeerIdentityMismatchError otherwise."""
+        fingerprints = self._observe_dialed_fingerprints(address)
+        if fingerprints != {verified_fp}:
+            self.lgr.warning(
+                "Peer %s: transport certificate to %s changed after "
+                "verification (observed %s, verified %s) — refusing session.",
+                self.peer_name, address, sorted(fingerprints), verified_fp,
+            )
+            raise PeerIdentityMismatchError(
+                f"peer {self.peer_name!r}: transport certificate changed "
+                f"after verification"
+            )
 
     def _open_server_event_stream(self, stub, sub):
         """Open ServerEventStream (client→server streaming RPC)."""
@@ -425,7 +676,7 @@ class FederateClient:
         events with no mappable local group or decode failures.
         """
         try:
-            evt, fed_meta = decode_fn(proto)
+            evt, fed_meta = decode_fn(proto, local_max_hops=self.local_max_hops)
         except Exception as exc:  # pylint: disable=broad-except
             self.lgr.warning("Failed to decode inbound FederatedEvent: %s", exc)
             return

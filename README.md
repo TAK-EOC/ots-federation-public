@@ -111,6 +111,11 @@ against, and [`docs/interop-test-plan.md`](docs/interop-test-plan.md) for
 the interop test methodology (scenario matrix, payload types, direction
 coverage, group-policy cases, link-stability checks).
 
+## Security
+
+See [`docs/SECURITY.md`](docs/SECURITY.md) for the trust model, what group
+scope enforcement guarantees, and how to report a vulnerability.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

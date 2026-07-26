@@ -313,8 +313,48 @@ def encode_federated_event(
     return fed_evt
 
 
+def _resolve_max_hops(wire_max_hops: int, local_max_hops: int) -> int:
+    """
+    Resolve a received FederateHops.maxHops against OUR configured ceiling.
+
+    Never let a peer obtain unlimited relay simply by omitting the field
+    (proto3 defaults an absent int32 to 0) or by sending an explicit
+    non-positive value. A peer MAY tighten the effective hop budget by
+    declaring a smaller positive max_hops than ours; it can never loosen it
+    past our own configured limit.
+
+    This is defense-in-depth, not the primary loop guard — the provenance
+    chain (loop_filter.py: refuse to re-relay anything carrying our own
+    node_id) is what actually prevents a cycle; this clamp only bounds how
+    far a single event can travel before that guard would matter, and
+    limits amplification if provenance were ever stripped in transit.
+
+    Parameters
+    ----------
+    wire_max_hops : int
+        The value read from the wire (FederateHops.maxHops). 0 covers both
+        an explicitly-sent zero and an absent field (proto3 scalar default).
+    local_max_hops : int
+        This node's configured ceiling ([federation] max_hops, or a per-peer
+        override). -1 means the operator has explicitly configured no local
+        ceiling (unlimited); there is then nothing to clamp against, so the
+        peer's own (positive) declared budget is honored as-is.
+
+    Returns
+    -------
+    int
+        The max_hops value to carry in FedMeta.
+    """
+    if wire_max_hops <= 0:
+        return local_max_hops
+    if local_max_hops <= 0:
+        return wire_max_hops
+    return min(wire_max_hops, local_max_hops)
+
+
 def decode_federated_event(
     proto: "fig_pb2.FederatedEvent",
+    local_max_hops: int = 3,
 ) -> Tuple[Optional[models.Event], FedMeta]:
     """Decode a FederatedEvent proto into (models.Event, FedMeta).
 
@@ -335,6 +375,13 @@ def decode_federated_event(
     ----------
     proto : fig_pb2.FederatedEvent
         The received protobuf message.
+    local_max_hops : int
+        This node's configured hop ceiling ([federation] max_hops, default
+        3). An absent or non-positive wire max_hops resolves to this value
+        rather than to unlimited — see _resolve_max_hops. Defaults to 3
+        (the FederationConfig default) for callers that don't have a config
+        object in hand; production call sites pass their own configured
+        value explicitly.
 
     Returns
     -------
@@ -355,7 +402,7 @@ def decode_federated_event(
     fed_meta = FedMeta(
         seen_server_ids=[p.federationServerId for p in proto.federateProvenance],
         current_hops=proto.federateHops.currentHops,
-        max_hops=proto.federateHops.maxHops if proto.federateHops.maxHops != 0 else -1,
+        max_hops=_resolve_max_hops(proto.federateHops.maxHops, local_max_hops),
         group_hop_limits=group_hop_limits,
     )
 

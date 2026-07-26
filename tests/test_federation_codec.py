@@ -336,12 +336,23 @@ class TestDecodeBasicEvent(unittest.TestCase):
         self.assertEqual(self.meta.seen_server_ids, [])
 
     def test_fed_meta_hops(self):
-        # No FedMeta was passed to encode → maxHops=0 in proto → decoded as -1
+        # No FedMeta was passed to encode -> maxHops=0 in proto (absent).
+        # Hop clamp: absent/zero NEVER resolves to unlimited (-1) anymore
+        # -- it resolves to decode_federated_event's local_max_hops, which
+        # defaults to 3 here since this test doesn't pass one explicitly.
         self.assertEqual(self.meta.current_hops, 0)
-        self.assertEqual(self.meta.max_hops, -1)
+        self.assertEqual(self.meta.max_hops, 3)
 
 
 class TestDecodeFedMeta(unittest.TestCase):
+    """
+    Wire max_hops BELOW the local ceiling passes through unclamped -- the
+    clamp only ever tightens, never loosens, so a peer declaring a smaller
+    budget than ours is honored as-is. local_max_hops=20 is set explicitly
+    (above the wire value of 10) so this class exercises the pass-through
+    case; TestHopClamp below exercises the clamp itself.
+    """
+
     def setUp(self):
         evt = _make_basic_event()
         meta = FedMeta(
@@ -350,7 +361,7 @@ class TestDecodeFedMeta(unittest.TestCase):
             max_hops=10,
         )
         proto = encode_federated_event(evt, fed_meta=meta)
-        _, self.meta = decode_federated_event(proto)
+        _, self.meta = decode_federated_event(proto, local_max_hops=20)
 
     def test_seen_server_ids(self):
         self.assertEqual(self.meta.seen_server_ids, ["SRV-1", "SRV-2"])
@@ -360,6 +371,100 @@ class TestDecodeFedMeta(unittest.TestCase):
 
     def test_max_hops(self):
         self.assertEqual(self.meta.max_hops, 10)
+
+
+class TestHopClamp(unittest.TestCase):
+    """
+    Hop-budget clamp fix. An absent or non-positive wire max_hops must
+    resolve to OUR configured ceiling, never
+    to unlimited -- and a peer cannot loosen our ceiling by declaring a
+    larger one; it can only ever declare a tighter one.
+
+    This is defense-in-depth: loop_filter.py's provenance chain (refuse to
+    re-relay anything already carrying our own node_id) is the primary loop
+    guard and is unaffected by any of this. The clamp only bounds how far a
+    single event can travel and limits amplification if provenance were
+    ever stripped in transit.
+    """
+
+    def _decode_with(self, wire_max_hops, wire_current_hops=0, local_max_hops=3):
+        """Build a proto with the given wire hop values and decode it."""
+        evt = _make_basic_event()
+        meta = FedMeta(current_hops=wire_current_hops, max_hops=wire_max_hops)
+        proto = encode_federated_event(evt, fed_meta=meta)
+        _, decoded_meta = decode_federated_event(proto, local_max_hops=local_max_hops)
+        return decoded_meta
+
+    # --- Unit-level: _resolve_max_hops directly -----------------------
+
+    def test_resolve_absent_zero_to_local_default(self):
+        from ots_federation.codec import _resolve_max_hops
+        self.assertEqual(_resolve_max_hops(0, 3), 3)
+
+    def test_resolve_negative_wire_to_local_default(self):
+        """A malicious/malformed negative wire value is treated the same as absent."""
+        from ots_federation.codec import _resolve_max_hops
+        self.assertEqual(_resolve_max_hops(-1, 3), 3)
+        self.assertEqual(_resolve_max_hops(-99, 3), 3)
+
+    def test_resolve_peer_cannot_loosen_past_local_ceiling(self):
+        """
+        NEGATIVE assertion: a peer claiming maxHops=99 must NOT be honored
+        when our local ceiling is 3 -- this is the exact exploit from the
+        security review (peer-supplied maxHops=99 honoured verbatim).
+        """
+        from ots_federation.codec import _resolve_max_hops
+        self.assertEqual(_resolve_max_hops(99, 3), 3)
+
+    def test_resolve_peer_may_tighten_budget(self):
+        """A peer declaring a SMALLER budget than ours is honored as-is."""
+        from ots_federation.codec import _resolve_max_hops
+        self.assertEqual(_resolve_max_hops(2, 3), 2)
+
+    def test_resolve_no_local_ceiling_honors_wire_value(self):
+        """
+        local_max_hops<=0 means the operator explicitly configured no local
+        ceiling; there is nothing to clamp against, so a positive wire value
+        passes through.
+        """
+        from ots_federation.codec import _resolve_max_hops
+        self.assertEqual(_resolve_max_hops(99, -1), 99)
+
+    def test_resolve_no_local_ceiling_absent_wire_stays_unlimited(self):
+        """
+        Both absent AND no local ceiling: the only case where the result is
+        genuinely -1 -- and it required an explicit operator opt-in
+        (local_max_hops=-1), not a default.
+        """
+        from ots_federation.codec import _resolve_max_hops
+        self.assertEqual(_resolve_max_hops(0, -1), -1)
+
+    # --- Integration-level: through decode_federated_event -------------
+
+    def test_decode_absent_hops_clamps_to_configured_default(self):
+        """maxHops=0 (absent) resolves to local_max_hops, not -1 (unlimited)."""
+        meta = self._decode_with(wire_max_hops=0, local_max_hops=3)
+        self.assertEqual(meta.max_hops, 3)
+
+    def test_decode_zero_hops_clamps_to_configured_default(self):
+        """Explicit maxHops=0 resolves identically to an absent field."""
+        meta = self._decode_with(wire_max_hops=0, local_max_hops=5)
+        self.assertEqual(meta.max_hops, 5)
+
+    def test_decode_unbounded_peer_claim_is_clamped(self):
+        """
+        NEGATIVE assertion: a peer emitting maxHops=99 with our ceiling
+        configured at 3 must decode to max_hops=3, never 99 -- confirms the
+        wiring from decode_federated_event through to FedMeta, not just the
+        helper function in isolation.
+        """
+        meta = self._decode_with(wire_max_hops=99, local_max_hops=3)
+        self.assertEqual(meta.max_hops, 3)
+
+    def test_decode_current_hops_untouched_by_clamp(self):
+        """The clamp only touches max_hops; current_hops passes through as-is."""
+        meta = self._decode_with(wire_max_hops=0, wire_current_hops=7, local_max_hops=3)
+        self.assertEqual(meta.current_hops, 7)
 
 
 class TestDecodeTAKUser(unittest.TestCase):
@@ -490,6 +595,13 @@ class TestRoundTripTAKUser(unittest.TestCase):
 
 
 class TestRoundTripFedMeta(unittest.TestCase):
+    """
+    max_hops round-trips only when it's at or below the receiving node's own
+    configured ceiling (local_max_hops=10 here, above the wire value of 7) --
+    see TestHopClamp for the case where a wire value exceeds the local
+    ceiling and must be clamped down instead of preserved.
+    """
+
     def setUp(self):
         evt = _make_basic_event()
         self.orig_meta = FedMeta(
@@ -498,7 +610,7 @@ class TestRoundTripFedMeta(unittest.TestCase):
             max_hops=7,
         )
         proto = encode_federated_event(evt, fed_meta=self.orig_meta)
-        _, self.recovered_meta = decode_federated_event(proto)
+        _, self.recovered_meta = decode_federated_event(proto, local_max_hops=10)
 
     def test_seen_server_ids_preserved(self):
         self.assertEqual(

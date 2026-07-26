@@ -121,6 +121,7 @@ class FederationManager:
                 bridge=self.bridge,
                 group_registry=self.group_registry,
                 allow_federated_delete=getattr(config, "allow_federated_delete", False),
+                local_max_hops=getattr(config, "max_hops", 3),
             )
             self._clients[peer_cfg.name] = client
             self.lgr.info(
@@ -137,14 +138,19 @@ class FederationManager:
         plus the [federation]-level default group policy..
 
         Each peer's group_map_in / group_map_out strings are parsed via
-        parse_group_map and registered with the peer's server_id as the
-        provisional key "address:port". FederateClient.run_grpc_thread calls
-        registry.rekey_peer(provisional_id, real_server_id) after getIdentity
-        returns, fixing the address:port → server_id key mismatch at runtime.
+        parse_group_map and registered under the provisional key
+        "address:port" (and additionally under the declared server_id when
+        set, Option-1A). At runtime, BOTH directions resolve a live
+        connection to one of these keys exclusively via the peer's
+        configured certificate fingerprint (register_fingerprint /
+        resolve_peer_id_by_fingerprint, applied the same way for both
+        inbound and outbound); the wire-reported serverId never selects a
+        key, and FederateClient no longer rekeys the registry from
+        getIdentity().
 
         The [federation]-level default_group_map_in / default_group_map_out keys
         supply fallback policy for any peer (inbound OR outgoing) whose server_id
-        has no explicit per-peer table entry after the rekey. This is the
+        has no explicit per-peer table entry. This is the
         primary mechanism for opening inbound TAK Server peers that have no
         [federate:*] section.
 
@@ -197,17 +203,41 @@ class FederationManager:
             if not peer_cfg.enabled:
                 continue
             # Use the peer address:port as the provisional peer_id key.
-            # FederateClient._run_session calls registry.rekey_peer with the
-            # real server_id once getIdentity completes.
             provisional_id = f"{peer_cfg.address}:{peer_cfg.port}"
 
             # Shortcut-1 Option-1A: if the operator declared an expected
             # server_id for this peer, also key the registry under that string
             # so inbound-only peers (we never dial them) are matched to this
             # stanza's policy rather than falling through to global defaults.
-            # rekey_peer() merges on top of this when the real server_id arrives
-            # outbound, so the two-key layout is safe.
             declared_server_id = getattr(peer_cfg, "server_id", "")
+
+            # Fingerprint-keyed identity binding: register each of this
+            # peer's configured certificate fingerprints
+            # (comma-separated when the peer's client and server TLS certs
+            # are distinct leaves) against whichever key its group tables
+            # are registered under (declared server_id when set, else the
+            # provisional address:port key). This table is the ONLY way a
+            # live connection — inbound (fed_server.py resolving the
+            # connecting client cert) or outbound (client.py resolving the
+            # dialed server's presented cert) — is matched to a policy;
+            # neither direction ever trusts a wire-supplied serverId. A peer
+            # with no `fingerprint` configured is simply absent from this
+            # table — its inbound connections are quarantined and outbound
+            # dials to it refused until the operator sets one; there is no
+            # default to fall back to.
+            declared_fingerprint = getattr(peer_cfg, "fingerprint", "")
+            if declared_fingerprint:
+                fingerprint_peer_key = declared_server_id or provisional_id
+                for fp_part in declared_fingerprint.split(","):
+                    fp_part = fp_part.strip()
+                    if not fp_part:
+                        continue
+                    registry.register_fingerprint(fp_part, fingerprint_peer_key)
+                lgr.info(
+                    "Peer %s: registered certificate fingerprint(s) for "
+                    "identity binding (resolve to %r)",
+                    peer_cfg.name, fingerprint_peer_key,
+                )
 
             # Wire fallback_when_no_group_mappings.
             if getattr(peer_cfg, "fallback_when_no_group_mappings", False):

@@ -39,6 +39,7 @@ from datetime import datetime as dt, timedelta
 
 from ots_federation.bridge import FederationBridge
 from ots_federation.bus import RouterFakeBus
+from ots_federation.cert_identity import fingerprint_from_pem
 from ots_federation.client import FederateClient, PeerState
 from ots_federation.codec import FedMeta
 from ots_federation.config import (
@@ -142,6 +143,8 @@ class FederationLoopbackTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="ots-fed-loopback-")
         self._pki = _gen_loopback_pki(self._tmp)
+        with open(self._pki["client_crt"], "rb") as f:
+            client_cert_fingerprint = fingerprint_from_pem(f.read())
 
         # --- SERVER side: FederationManager with inbound listener enabled ---
         server_ssl = FederationSslConfig(
@@ -157,18 +160,36 @@ class FederationLoopbackTest(unittest.TestCase):
             listen_enabled=True,
             listen_ip="127.0.0.1",
             listen_port=0,  # ephemeral — bound port read back after start
-            peers=[],
+            # Identity binding (bind federation ACL decisions to the
+            # authenticated cert fingerprint -- corrected implementation
+            # after an earlier trust-on-first-use attempt was rejected in
+            # verification): policy is now resolved SOLELY from the
+            # connecting certificate's fingerprint against this peer's
+            # `fingerprint` — declared server_id is a label only and is never
+            # consulted for the policy decision. This loopback client
+            # authenticates with a real mTLS certificate but declares no
+            # [federate:*] stanza of its own, so its cert's fingerprint must
+            # be explicitly registered here to be admitted at all; the group
+            # policy itself (wildcard in, White out) is unchanged from
+            # before the fix. The address/port below are never dialed — the
+            # server only ever receives this peer inbound — the entry exists
+            # purely to register the client cert's fingerprint and group
+            # policy; FederationManager also spawns a harmless outbound dial
+            # thread for it that fails to connect and is stopped cleanly in
+            # tearDown.
+            peers=[
+                FederatePeerConfig(
+                    name="loopback-client-identity",
+                    enabled=True,
+                    address="127.0.0.1",
+                    port=1,
+                    server_id=self.CLIENT_ID,
+                    fingerprint=client_cert_fingerprint,
+                    group_map_in="*:White",
+                    group_map_out="White:White",
+                ),
+            ],
             ssl=server_ssl,
-            # Allow White-group events to flow server→client.  After the
-            # ticket-46f6dd fix, events with no determinable group are blocked
-            # by the outbound group policy even when the registry is otherwise
-            # empty.  Without this default_group_map_out, test_server_to_client
-            # would correctly suppress the test event and assert failure.
-            default_group_map_out="White:White",
-            # After the b39e05 change, group-less inbound events (this loopback
-            # client sends no federateGroups) are admitted only via a wildcard
-            # accept_as — mirror of the default_group_map_out note above.
-            default_group_map_in="*:White",
         )
         self.server_mgr = FederationManager(self.server_cfg)
 
@@ -388,6 +409,230 @@ class FederationLoopbackTest(unittest.TestCase):
         self.assertIsInstance(got.detail, TAKUser)
         # Phase-1 string migration: group is now a plain str, not Teams enum.
         self.assertEqual(got.detail.group, "Cyan")
+
+
+class OutboundCertIdentityLoopbackTest(unittest.TestCase):
+    """
+    REAL-mTLS integration tests for the outbound cert-identity binding: a
+    real FederateClient dials a real TLS gRPC FederatedChannel server over
+    loopback, and the client's
+    session policy identity must be resolved from the certificate the
+    server ACTUALLY presented during the TLS handshake — observed through
+    the live channelz socket, the real production mechanism — never from
+    the serverId the server reports over getIdentity().
+
+    Unlike FederateClientCertIdentityBindingTest (which stubs the
+    observation), nothing here is mocked: TLS handshake, channelz
+    observation, fingerprint resolution, and refusal all run for real.
+    """
+
+    REPORTED_WIRE_ID = "WIRE-REPORTED-ID"  # what the dialed server CLAIMS
+    PEER_POLICY_KEY = "OTS-SERVER"         # what its cert actually resolves to
+
+    def setUp(self):
+        import grpc
+        from concurrent import futures as cf
+
+        from ots_federation.proto import fig_pb2, fig_pb2_grpc
+
+        self._tmp = tempfile.mkdtemp(prefix="ots-fed-outid-")
+        self._pki = _gen_loopback_pki(self._tmp)
+        with open(self._pki["server_crt"], "rb") as f:
+            self.server_cert_fingerprint = fingerprint_from_pem(f.read())
+
+        reported_id = self.REPORTED_WIRE_ID
+
+        class _MiniServicer(fig_pb2_grpc.FederatedChannelServicer):
+            """Minimal real-TLS FederatedChannel peer. Reports a wire
+            serverId that deliberately differs from any registry key so a
+            policy binding to it is unambiguously detectable."""
+
+            def getIdentity(self, request, context):
+                return fig_pb2.Identity(
+                    serverId=reported_id, name="mini-loopback"
+                )
+
+            def ServerEventStream(self, request_iterator, context):
+                for _ in request_iterator:
+                    pass
+                return fig_pb2.Subscription()
+
+            def ClientFederateGroupsStream(self, request_iterator, context):
+                for _ in request_iterator:
+                    pass
+                return fig_pb2.Subscription()
+
+            def ClientEventStream(self, request, context):
+                while context.is_active():
+                    time.sleep(0.05)
+                return
+                yield  # pragma: no cover — makes this a generator
+
+            def ServerFederateGroupsStream(self, request, context):
+                while context.is_active():
+                    time.sleep(0.05)
+                return
+                yield  # pragma: no cover
+
+            def HealthCheck(self, request, context):
+                return fig_pb2.ServerHealth(
+                    status=fig_pb2.ServerHealth.ServingStatus.SERVING
+                )
+
+        def _read(path):
+            with open(path, "rb") as f:
+                return f.read()
+
+        self._grpc_server = grpc.server(cf.ThreadPoolExecutor(max_workers=8))
+        fig_pb2_grpc.add_FederatedChannelServicer_to_server(
+            _MiniServicer(), self._grpc_server
+        )
+        creds = grpc.ssl_server_credentials(
+            [(_read(self._pki["server_key"]), _read(self._pki["server_crt"]))],
+            root_certificates=_read(self._pki["ca_crt"]),
+            require_client_auth=True,
+        )
+        self.bound_port = self._grpc_server.add_secure_port(
+            "127.0.0.1:0", creds
+        )
+        self._grpc_server.start()
+
+        self._client = None
+        self._client_thread = None
+        self._client_bridge = None
+
+    def tearDown(self):
+        if self._client is not None:
+            try:
+                self._client.request_stop()
+            except Exception:
+                pass
+        try:
+            self._grpc_server.stop(grace=0)
+        except Exception:
+            pass
+        if self._client_thread is not None:
+            self._client_thread.join(timeout=5.0)
+        if self._client_bridge is not None:
+            try:
+                self._client_bridge.close()
+            except Exception:
+                pass
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _start_client(self, registry):
+        self._client_bridge = FederationBridge()
+        peer_cfg = FederatePeerConfig(
+            name="mini-server",
+            enabled=True,
+            address="127.0.0.1",
+            port=self.bound_port,
+            ca_cert=self._pki["ca_crt"],
+            client_cert=self._pki["client_crt"],
+            client_key=self._pki["client_key"],
+            max_hops=3,
+            reconnect_interval=1,
+            health_check_interval=60,
+        )
+        self._client = FederateClient(
+            peer_name="mini-server",
+            peer_config=peer_cfg,
+            node_id="OTS-CLIENT",
+            bridge=self._client_bridge,
+            group_registry=registry,
+        )
+        self._observed_states = []
+        original_set_state = self._client._set_state
+
+        def _tracking_set_state(new_state):
+            self._observed_states.append(new_state)
+            original_set_state(new_state)
+
+        self._client._set_state = _tracking_set_state
+        self._client_thread = threading.Thread(
+            target=self._client.run_grpc_thread, daemon=True
+        )
+        self._client_thread.start()
+        return self._client
+
+    def test_configured_server_cert_fingerprint_reaches_active_with_cert_key(self):
+        """Honest peer: the dialed server's REAL presented cert resolves via
+        the fingerprint table (observed through live channelz over real TLS)
+        and the session's policy key is the registry key — NOT the
+        unrelated serverId the server reported over getIdentity()."""
+        from ots_federation.groups import (
+            FederateGroupRegistry,
+            FederatePeerGroupMap,
+        )
+
+        registry = FederateGroupRegistry()
+        registry.add_peer_map(FederatePeerGroupMap(
+            peer_id=self.PEER_POLICY_KEY, direction="both",
+            remote_group="White", local_group="White",
+        ))
+        registry.register_fingerprint(
+            self.server_cert_fingerprint, self.PEER_POLICY_KEY
+        )
+
+        client = self._start_client(registry)
+
+        ok = _wait_until(
+            lambda: client.state == PeerState.ACTIVE, timeout=15.0
+        )
+        self.assertTrue(
+            ok, f"client never reached ACTIVE (state={client.state})"
+        )
+        self.assertEqual(
+            client.remote_server_id, self.PEER_POLICY_KEY,
+            "policy identity must be the cert-resolved registry key",
+        )
+        self.assertNotEqual(
+            client.remote_server_id, self.REPORTED_WIRE_ID,
+            "the wire-reported serverId must never become the policy key",
+        )
+
+    def test_unconfigured_server_cert_refused_never_active(self):
+        """Attacker-shaped peer: a dialed host whose (real, fed-CA-signed)
+        server cert fingerprint is NOT configured for any peer gets no
+        session and no policy — regardless of the serverId it reports —
+        and a differently-keyed victim peer's tables stay untouched."""
+        from ots_federation.groups import (
+            FederateGroupRegistry,
+            FederatePeerGroupMap,
+        )
+
+        registry = FederateGroupRegistry()
+        # A victim peer with a privileged map; note the dialed server's
+        # actual cert fingerprint is deliberately NOT registered.
+        registry.add_peer_map(FederatePeerGroupMap(
+            peer_id=self.REPORTED_WIRE_ID, direction="both",
+            remote_group="SECRET", local_group="SECRET",
+        ))
+        victim_fp = "AA:" * 31 + "AA"
+        registry.register_fingerprint(victim_fp, self.REPORTED_WIRE_ID)
+
+        client = self._start_client(registry)
+
+        # The session must be refused: the client falls to RECONNECTING
+        # after PeerIdentityMismatchError, without ever passing ACTIVE.
+        ok = _wait_until(
+            lambda: client.state == PeerState.RECONNECTING, timeout=15.0
+        )
+        self.assertTrue(
+            ok,
+            f"client never reached RECONNECTING (state={client.state})",
+        )
+        self.assertNotIn(PeerState.ACTIVE, self._observed_states)
+        self.assertIsNone(
+            client.remote_server_id,
+            "no policy identity may bind for an unconfigured server cert, "
+            "regardless of the reported serverId",
+        )
+        # Victim tables intact and never handed to this session.
+        self.assertEqual(
+            registry.map_inbound_groups(self.REPORTED_WIRE_ID, ["SECRET"]),
+            {"SECRET"},
+        )
 
 
 if __name__ == "__main__":

@@ -134,6 +134,30 @@ class FederatePeerConfig:
     # Absent (empty string) = current behavior (keyed by address:port only,
     # rekeyed to real server_id only when our FederateClient dials outbound).
     # Shortcut-1 Option-1A.
+    fingerprint: str = ""
+    # SHA-256 fingerprint(s) (colon-hex, case-insensitive on input, normalized
+    # to upper-case at parse time; comma-separated when the peer uses distinct
+    # client and server certificates) of the certificate(s) THIS peer
+    # authenticates with. This is the ONLY value group-ACL resolution keys
+    # peer identity on — in BOTH directions, binding federation ACL
+    # decisions to the authenticated cert identity rather than anything
+    # self-asserted. It is never inferred and never defaults:
+    #   - An INBOUND connection whose presented client certificate's
+    #     fingerprint does not match a configured peer's `fingerprint` here
+    #     is quarantined (empty policy, no fallthrough to [federation]
+    #     defaults), even if the wire-supplied Subscription.identity.serverId
+    #     matches this peer's declared server_id or name.
+    #   - An OUTBOUND dial whose remote end presents a server certificate
+    #     with a fingerprint not configured for any peer is REFUSED (no
+    #     session, no policy), regardless of what getIdentity() reports.
+    #     When this peer's TLS server certificate differs from its client
+    #     certificate (gen_fed_ca issues separate leaf certs), list BOTH
+    #     fingerprints, comma-separated.
+    # `ots-fed-certs export` prints the exact value(s) to paste here (see
+    # gen_fed_ca.py's export bundle templates).
+    # Absent (empty string) = this peer can never be matched by fingerprint;
+    # inbound connections are quarantined and outbound dials refused until
+    # the operator sets this.
     # CoreConfig parity knobs
     display_name: str = ""  # displayName → MUST be present, error if missing
     protocol_version: int = 2  # protocolVersion
@@ -420,6 +444,33 @@ def _parse_peer_section(cfg: configparser.ConfigParser, section: str) -> Federat
     # connectionToken: return None if absent (SECRET, never a default string)
     connection_token = cfg.get(section, "connection_token", fallback=None)
 
+    # fingerprint: the ONLY value peer identity binding resolves against, in
+    # both directions (never the wire-supplied serverId). Accepts a
+    # comma-separated list because a peer's client and server TLS certificates
+    # may be distinct leaves (gen_fed_ca issues both): inbound resolves the
+    # peer's CLIENT cert, outbound the peer's SERVER cert. Normalize
+    # case/whitespace here so every downstream comparison is against the
+    # canonical upper-case colon-hex form; a malformed value fails config
+    # load immediately rather than silently never matching at runtime.
+    raw_fingerprint = _get_str(cfg, section, "fingerprint")
+    if raw_fingerprint:
+        from ots_federation.cert_identity import (  # pylint: disable=import-outside-toplevel
+            FingerprintFormatError,
+            normalize_fingerprint_colon_hex,
+        )
+        normalized_parts = []
+        for part in raw_fingerprint.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                normalized_parts.append(normalize_fingerprint_colon_hex(part))
+            except FingerprintFormatError as exc:
+                raise configparser.Error(f"[{section}] {exc}") from exc
+        fingerprint = ",".join(normalized_parts)
+    else:
+        fingerprint = ""
+
     return FederatePeerConfig(
         name=peer_name,
         enabled=_get_bool(cfg, section, "enabled", fallback=True),
@@ -435,6 +486,7 @@ def _parse_peer_section(cfg: configparser.ConfigParser, section: str) -> Federat
         reconnect_interval=_get_int(cfg, section, "reconnect_interval", fallback=30),
         health_check_interval=_get_int(cfg, section, "health_check_interval", fallback=10),
         server_id=_get_str(cfg, section, "server_id"),
+        fingerprint=fingerprint,
         # CoreConfig parity knobs
         display_name=display_name,
         protocol_version=_get_int(cfg, section, "protocol_version", fallback=2),

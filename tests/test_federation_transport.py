@@ -639,6 +639,298 @@ class FederateClientHandshakeTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# FederateClient — outbound identity binding: the session's group-policy
+# identity is resolved EXCLUSIVELY from the SHA-256 fingerprint of the TLS
+# certificate the DIALED SERVER actually presented, looked up against the same per-peer
+# `fingerprint` table the inbound path uses (mirrors TAK Server,
+# TakFigClient.java:1268-1311). The wire getIdentity().serverId NEVER
+# selects policy — an attacker at the dialed address holding any valid
+# fed-CA certificate whose fingerprint is not configured gets NOTHING,
+# regardless of what serverId it reports. This is unconditional whenever a
+# group registry exists: there is no config shape (server_id unset, etc.)
+# that skips the check — the two prior attempts (trust-on-first-use, then a
+# check gated on the empty-by-default server_id field) were rejected in
+# verification precisely for leaving such gaps.
+# ---------------------------------------------------------------------------
+
+
+def _fp(seed: str) -> str:
+    """Deterministic, well-formed colon-hex SHA-256 fingerprint for tests."""
+    import hashlib
+
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return ":".join(f"{b:02X}" for b in digest)
+
+
+FP_PEER = _fp("the-genuine-dialed-peer-cert")
+FP_VICTIM = _fp("the-victim-peer-cert")
+FP_ATTACKER = _fp("an-attacker-cert-signed-by-the-fed-ca")
+
+
+class FederateClientCertIdentityBindingTest(unittest.TestCase):
+    """
+    _run_session must bind the session policy identity from the dialed
+    server's presented certificate fingerprint (via the registry's
+    fingerprint table) BEFORE any application RPC, refuse
+    (PeerIdentityMismatchError) on any unconfigured / unobservable /
+    ambiguous certificate, and never let the wire-reported serverId select
+    a policy key.
+    """
+
+    PEER_KEY = "127.0.0.1:9100"  # provisional registry key for the dialed stanza
+
+    def setUp(self):
+        from ots_federation.groups import (
+            FederateGroupRegistry,
+            FederatePeerGroupMap,
+        )
+
+        self.bridge = FederationBridge()
+        # REAL registry (not a MagicMock) so the negative assertions test
+        # actual policy state, not mock bookkeeping.
+        self.registry = FederateGroupRegistry()
+        # The dialed peer's own (restrictive) policy under its provisional key.
+        self.registry.add_peer_map(FederatePeerGroupMap(
+            peer_id=self.PEER_KEY, direction="both",
+            remote_group="White", local_group="White",
+        ))
+        self.registry.register_fingerprint(FP_PEER, self.PEER_KEY)
+        # A DIFFERENT configured peer ("tak-victim") with a privileged map —
+        # the thing an attacker must never obtain.
+        self.registry.add_peer_map(FederatePeerGroupMap(
+            peer_id="tak-victim", direction="both",
+            remote_group="SECRET", local_group="SECRET",
+        ))
+        self.registry.register_fingerprint(FP_VICTIM, "tak-victim")
+
+    def tearDown(self):
+        self.bridge.close()
+
+    def _make_client(self, observed_fingerprints, registry="default", **cfg_kwargs):
+        if registry == "default":
+            registry = self.registry
+        client = FederateClient(
+            peer_name="dialed-peer",
+            peer_config=_make_peer_config(**cfg_kwargs),
+            node_id="TAKY-TEST-01",
+            bridge=self.bridge,
+            group_registry=registry,
+        )
+        # Stub the transport-layer plumbing that needs a real channel:
+        # _wait_channel_ready (grpc readiness) and _observe_dialed_fingerprints
+        # (channelz observation of the presented server cert). Everything
+        # downstream — resolution, refusal, binding — runs for real.
+        client._wait_channel_ready = mock.MagicMock()
+        if isinstance(observed_fingerprints, list):
+            client._observe_dialed_fingerprints = mock.MagicMock(
+                side_effect=observed_fingerprints
+            )
+        else:
+            client._observe_dialed_fingerprints = mock.MagicMock(
+                return_value=observed_fingerprints
+            )
+        return client
+
+    def _build_mock_stub(self, server_id, name="Remote Server"):
+        from ots_federation.proto import fig_pb2  # noqa: F811
+
+        stub = mock.MagicMock()
+        stub.getIdentity.return_value = fig_pb2.Identity(
+            serverId=server_id,
+            name=name,
+            type=fig_pb2.Identity.ConnectionType.FEDERATION_TAK_SERVER,
+        )
+        stub.ServerEventStream.return_value = mock.MagicMock()
+        stub.ClientFederateGroupsStream.return_value = mock.MagicMock()
+        stub.ClientEventStream.return_value = iter([])
+        stub.ServerFederateGroupsStream.return_value = iter([])
+        stub.HealthCheck.return_value = fig_pb2.ServerHealth(
+            status=fig_pb2.ServerHealth.ServingStatus.SERVING
+        )
+        return stub
+
+    def _run_session_with_stub(self, client, stub):
+        with mock.patch(
+            "ots_federation.client.grpc.secure_channel"
+        ) as mock_channel, mock.patch(
+            "ots_federation.client.fig_pb2_grpc.FederatedChannelStub",
+            return_value=stub,
+        ), mock.patch(
+            "ots_federation.client.FederateClient._build_credentials",
+            return_value=mock.MagicMock(),
+        ):
+            mock_channel.return_value.__enter__ = lambda s: s
+            mock_channel.return_value.__exit__ = mock.MagicMock(return_value=False)
+            client._run_session()
+
+    def _assert_victim_tables_intact(self):
+        self.assertEqual(
+            self.registry.map_inbound_groups("tak-victim", ["SECRET"]),
+            {"SECRET"},
+            "the victim peer's own tables must survive untouched",
+        )
+        self.assertEqual(
+            self.registry.map_outbound_groups("tak-victim", ["SECRET"]),
+            ["SECRET"],
+        )
+
+    def test_unconfigured_fingerprint_refused_regardless_of_reported_serverid(self):
+        """
+        THE core identity-spoofing reproduction, closed: a dialed host presenting a
+        valid-but-unconfigured fed-CA cert and reporting a victim peer's
+        serverId must get NOTHING — session refused before getIdentity is
+        even issued, no policy key bound, victim tables untouched. The
+        attacker stanza intentionally omits server_id (the default), the
+        exact configuration that defeated the previous, rejected fix.
+        """
+        from ots_federation.client import PeerIdentityMismatchError
+
+        client = self._make_client({FP_ATTACKER})  # server_id unset
+        stub = self._build_mock_stub(server_id="tak-victim")
+
+        with self.assertRaises(PeerIdentityMismatchError):
+            self._run_session_with_stub(client, stub)
+
+        self.assertIsNone(
+            client.remote_server_id,
+            "an unconfigured certificate must never bind a policy identity",
+        )
+        stub.getIdentity.assert_not_called()
+        stub.ClientEventStream.assert_not_called()
+        self.assertNotEqual(client.state, PeerState.ACTIVE)
+        self._assert_victim_tables_intact()
+
+    def test_unobservable_certificate_refused(self):
+        """No observable server certificate (insecure channel, channelz
+        failure) ⇒ refuse — never fall back to wire identity or config key."""
+        from ots_federation.client import PeerIdentityMismatchError
+
+        client = self._make_client(set())
+        stub = self._build_mock_stub(server_id="tak-victim")
+
+        with self.assertRaises(PeerIdentityMismatchError):
+            self._run_session_with_stub(client, stub)
+
+        self.assertIsNone(client.remote_server_id)
+        stub.getIdentity.assert_not_called()
+
+    def test_ambiguous_certificates_refused(self):
+        """Two distinct certs on live transports to the target ⇒ ambiguous ⇒
+        refuse, even when one of them is a configured peer's."""
+        from ots_federation.client import PeerIdentityMismatchError
+
+        client = self._make_client({FP_PEER, FP_ATTACKER})
+        stub = self._build_mock_stub(server_id="anything")
+
+        with self.assertRaises(PeerIdentityMismatchError):
+            self._run_session_with_stub(client, stub)
+
+        self.assertIsNone(client.remote_server_id)
+        stub.getIdentity.assert_not_called()
+
+    def test_configured_fingerprint_binds_policy_key_not_wire_serverid(self):
+        """
+        The honest-cert case: policy identity = the registry key the
+        VERIFIED fingerprint resolves to. A lying getIdentity().serverId
+        (claiming the victim peer) changes nothing — no rekey, no policy
+        movement, session keyed under the cert-resolved key.
+        """
+        client = self._make_client({FP_PEER})  # server_id unset (default)
+        stub = self._build_mock_stub(server_id="tak-victim")  # wire lie
+
+        with mock.patch.object(
+            self.registry, "rekey_peer", wraps=self.registry.rekey_peer
+        ) as rekey_spy:
+            try:
+                self._run_session_with_stub(client, stub)
+            except Exception:  # pylint: disable=broad-except
+                pass  # empty streams end the session; not under test here
+
+        self.assertEqual(
+            client.remote_server_id, self.PEER_KEY,
+            "policy identity must be the cert-resolved registry key",
+        )
+        self.assertNotEqual(client.remote_server_id, "tak-victim")
+        rekey_spy.assert_not_called()
+        self._assert_victim_tables_intact()
+
+    def test_cert_verification_happens_before_get_identity(self):
+        """The certificate must be resolved before ANY application RPC —
+        mirrors TAK Server, where resolution runs inside the TLS negotiator."""
+        order = []
+        client = self._make_client({FP_PEER})
+        client._observe_dialed_fingerprints = mock.MagicMock(
+            side_effect=lambda addr: (order.append("observe"), {FP_PEER})[-1]
+        )
+        stub = self._build_mock_stub(server_id="whatever")
+        stub.getIdentity.side_effect = lambda *a, **kw: (
+            order.append("getIdentity"),
+            stub.getIdentity.return_value,
+        )[-1]
+
+        try:
+            self._run_session_with_stub(client, stub)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        self.assertIn("observe", order)
+        self.assertIn("getIdentity", order)
+        self.assertLess(order.index("observe"), order.index("getIdentity"))
+
+    def test_recheck_failure_before_active_refuses(self):
+        """A transport-cert change between the pre-RPC check and stream
+        establishment must tear the session down before it goes ACTIVE."""
+        from ots_federation.client import PeerIdentityMismatchError
+
+        # First observation: genuine cert. Second (the pre-ACTIVE recheck):
+        # a different cert appeared on the transport.
+        client = self._make_client([{FP_PEER}, {FP_ATTACKER}])
+        stub = self._build_mock_stub(server_id="anything")
+
+        with self.assertRaises(PeerIdentityMismatchError):
+            self._run_session_with_stub(client, stub)
+
+        self.assertNotEqual(client.state, PeerState.ACTIVE)
+
+    def test_advisory_server_id_mismatch_still_refuses(self):
+        """Defense-in-depth: with server_id ALSO declared, a contradicting
+        wire report refuses the session even though the cert verified."""
+        from ots_federation.client import PeerIdentityMismatchError
+
+        client = self._make_client({FP_PEER}, server_id="expected-real-peer")
+        stub = self._build_mock_stub(server_id="something-else")
+
+        with self.assertRaises(PeerIdentityMismatchError):
+            self._run_session_with_stub(client, stub)
+
+        self.assertNotEqual(client.state, PeerState.ACTIVE)
+        stub.ClientEventStream.assert_not_called()
+
+    def test_no_registry_legacy_mode_skips_verification(self):
+        """With no group registry there is no policy to steal: the wire
+        serverId is recorded for display/echo-skip only (legacy behavior),
+        and no certificate observation is required."""
+        client = FederateClient(
+            peer_name="dialed-peer",
+            peer_config=_make_peer_config(),
+            node_id="TAKY-TEST-01",
+            bridge=self.bridge,
+            group_registry=None,
+        )
+        client._wait_channel_ready = mock.MagicMock()
+        client._observe_dialed_fingerprints = mock.MagicMock(return_value=set())
+        stub = self._build_mock_stub(server_id="whatever-it-claims")
+
+        try:
+            self._run_session_with_stub(client, stub)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        self.assertEqual(client.remote_server_id, "whatever-it-claims")
+        client._observe_dialed_fingerprints.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # FederateClient — reconnect back-off test
 # ---------------------------------------------------------------------------
 

@@ -78,7 +78,27 @@ SENDER_EUD_UID = "ANDROID-alice-1234"
 SENDER_CALLSIGN = "ALICE"
 
 
-def _make_bus(inject_cot_parser=False, eud_group_cache=None):
+class _FakeGroupResolver:
+    """
+    Test double for group_resolver.GroupResolver.resolve_by_callsign.
+
+    mapping: {callsign: [group, ...]} -- callsigns not present resolve to an
+    empty frozenset (genuinely no OUT groups, not a DB failure).
+    raise_for: callsigns that simulate a DB failure (raises, as
+    GroupResolveError would) rather than returning an empty result.
+    """
+
+    def __init__(self, mapping=None, raise_for=()):
+        self._mapping = mapping or {}
+        self._raise_for = set(raise_for)
+
+    def resolve_by_callsign(self, callsign):
+        if callsign in self._raise_for:
+            raise RuntimeError("simulated DB failure")
+        return frozenset(self._mapping.get(callsign, []))
+
+
+def _make_bus(inject_cot_parser=False, eud_group_cache=None, group_resolver=None):
     """OtsRmqBus with mocked LoopFilter and a real or provided EudGroupCache."""
     lf = MagicMock()
     lf.should_inject_inbound.return_value = True
@@ -96,6 +116,7 @@ def _make_bus(inject_cot_parser=False, eud_group_cache=None):
         eud_group_cache=eud_group_cache,
         pub_fail_threshold=5,
         inject_cot_parser=inject_cot_parser,
+        group_resolver=group_resolver,
     )
     mock_ch = MagicMock()
     bus._pub_ch = mock_ch
@@ -331,7 +352,8 @@ class TestInboundMartiDirectedDelivery(unittest.TestCase):
     # I1 — single-callsign marti: dms exchange, NOT groups
     def test_marti_single_callsign_goes_to_dms_not_groups(self):
         """I1: inject() with a marti event publishes to dms/CHARLIE, not groups exchange."""
-        bus, mock_ch = _make_bus(inject_cot_parser=False)
+        resolver = _FakeGroupResolver({"CHARLIE": ["FIRE-OPS"]})
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
         evt = _make_marti_evt(uid="MARTI-I1", callsigns=("CHARLIE",))
 
         bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
@@ -348,7 +370,10 @@ class TestInboundMartiDirectedDelivery(unittest.TestCase):
     # I2 — multi-callsign marti: one dms publish per callsign, no groups
     def test_marti_multi_callsign_goes_to_dms_per_callsign(self):
         """I2: multi-callsign marti event publishes to dms/<each-callsign>, not groups."""
-        bus, mock_ch = _make_bus(inject_cot_parser=False)
+        resolver = _FakeGroupResolver({
+            "CHARLIE": ["FIRE-OPS"], "DELTA": ["FIRE-OPS"], "ECHO": ["FIRE-OPS"],
+        })
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
         evt = _make_marti_evt(uid="MARTI-I2", callsigns=("CHARLIE", "DELTA", "ECHO"))
 
         bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
@@ -375,7 +400,8 @@ class TestInboundMartiDirectedDelivery(unittest.TestCase):
         incorrectly publishes to groups/FIRE-OPS.OUT, DELTA would receive the
         marti event addressed exclusively to CHARLIE.
         """
-        bus, mock_ch = _make_bus(inject_cot_parser=False)
+        resolver = _FakeGroupResolver({"CHARLIE": ["FIRE-OPS"]})
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
         evt = _make_marti_evt(uid="MARTI-I3-canary", callsigns=("CHARLIE",))
 
         bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
@@ -422,7 +448,8 @@ class TestInboundMartiWithInjectCotParser(unittest.TestCase):
 
     def test_marti_with_inject_cot_parser_true_publishes_to_both(self):
         """I5: marti + inject_cot_parser=True → dms/<callsign> AND cot_parser."""
-        bus, mock_ch = _make_bus(inject_cot_parser=True)
+        resolver = _FakeGroupResolver({"CHARLIE": ["FIRE-OPS"]})
+        bus, mock_ch = _make_bus(inject_cot_parser=True, group_resolver=resolver)
         evt = _make_marti_evt(uid="MARTI-I5-cot", callsigns=("CHARLIE",))
 
         bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
@@ -437,6 +464,120 @@ class TestInboundMartiWithInjectCotParser(unittest.TestCase):
             "cot_parser must be published for DB persistence when inject_cot_parser=True")
         self.assertNotIn("groups", exchanges,
             "groups exchange must remain silent for marti events even with inject_cot_parser=True")
+
+
+# ===========================================================================
+# I8-I13: Directed-message group-reachability gate. Directed addressing (marti <dest
+# callsign="...">) selects a CANDIDATE destination; group reachability
+# decides whether it is actually delivered -- the same check TAK Server
+# applies uniformly to every message regardless of origin. Without this
+# gate, a peer admitted to ONE local group could message any callsign on
+# the server by name, bypassing the ACL it was actually admitted under.
+# ===========================================================================
+
+class TestInboundMartiGroupReachability(unittest.TestCase):
+    """
+    NEGATIVE assertions: a directed event to a callsign OUTSIDE the sender's
+    admitted groups must be dropped, not delivered.
+    """
+
+    # I8 — destination in a DIFFERENT group than the sender's admitted set: drop
+    def test_marti_dropped_when_destination_out_of_group(self):
+        """
+        I8: CHARLIE belongs only to OTHER-OPS; the sender (peer) was admitted
+        into FIRE-OPS. The directed event must NOT reach dms/CHARLIE.
+        """
+        resolver = _FakeGroupResolver({"CHARLIE": ["OTHER-OPS"]})
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
+        evt = _make_marti_evt(uid="MARTI-I8", callsigns=("CHARLIE",))
+
+        bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
+
+        publishes = _collect_publishes(mock_ch)
+        self.assertEqual(
+            publishes, [],
+            "directed event to an out-of-group callsign must not be published anywhere",
+        )
+
+    # I9 — no group resolver configured at all: fail closed
+    def test_marti_dropped_when_no_group_resolver_configured(self):
+        """
+        I9: With no group_resolver wired in, reachability cannot be
+        established at all -- the ticket's own instruction is to fail
+        closed and log at debug, not to fall back to unconditional delivery.
+        """
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=None)
+        evt = _make_marti_evt(uid="MARTI-I9", callsigns=("CHARLIE",))
+
+        bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
+
+        publishes = _collect_publishes(mock_ch)
+        self.assertEqual(
+            publishes, [],
+            "with no group resolver, directed delivery must fail closed (dropped)",
+        )
+
+    # I10 — resolver raises (DB unreachable): fail closed
+    def test_marti_dropped_when_resolver_raises(self):
+        """I10: a resolver failure (DB unreachable) fails closed, not open."""
+        resolver = _FakeGroupResolver(raise_for=("CHARLIE",))
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
+        evt = _make_marti_evt(uid="MARTI-I10", callsigns=("CHARLIE",))
+
+        bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
+
+        publishes = _collect_publishes(mock_ch)
+        self.assertEqual(
+            publishes, [],
+            "a resolver failure must fail closed (dropped), never delivered",
+        )
+
+    # I11 — partial reachability: only the in-group destination is delivered
+    def test_marti_partial_multi_callsign_only_reachable_delivered(self):
+        """
+        I11: CHARLIE is in FIRE-OPS (reachable); DELTA is only in OTHER-OPS
+        (not reachable). Only dms/CHARLIE must be published.
+        """
+        resolver = _FakeGroupResolver({
+            "CHARLIE": ["FIRE-OPS"], "DELTA": ["OTHER-OPS"],
+        })
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
+        evt = _make_marti_evt(uid="MARTI-I11", callsigns=("CHARLIE", "DELTA"))
+
+        bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
+
+        publishes = _collect_publishes(mock_ch)
+        rks = [(e, rk) for e, rk, _ in publishes]
+        self.assertIn(("dms", "CHARLIE"), rks, "in-group destination must be delivered")
+        self.assertNotIn(("dms", "DELTA"), rks, "out-of-group destination must be dropped")
+
+    # I12 — genuinely-unknown callsign (empty group set, not a DB failure): drop
+    def test_marti_dropped_when_callsign_has_no_groups(self):
+        """I12: a callsign resolving to zero groups (unknown/ungrouped EUD) is dropped."""
+        resolver = _FakeGroupResolver({})  # CHARLIE resolves to frozenset()
+        bus, mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
+        evt = _make_marti_evt(uid="MARTI-I12", callsigns=("CHARLIE",))
+
+        bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
+
+        publishes = _collect_publishes(mock_ch)
+        self.assertEqual(publishes, [])
+
+    # I13 — the drop is observable at debug level
+    def test_marti_drop_logged_at_debug(self):
+        """I13: the reachability drop is logged at debug (per the ticket's
+        own instruction: 'fail closed and log at debug')."""
+        import logging
+        resolver = _FakeGroupResolver({"CHARLIE": ["OTHER-OPS"]})
+        bus, _mock_ch = _make_bus(inject_cot_parser=False, group_resolver=resolver)
+        evt = _make_marti_evt(uid="MARTI-I13", callsigns=("CHARLIE",))
+
+        with self.assertLogs("ots_federation.ots_bus", level=logging.DEBUG) as cm:
+            bus.inject(src=None, evt=evt, local_groups=frozenset(["FIRE-OPS"]))
+
+        log_text = " ".join(cm.output)
+        self.assertIn("CHARLIE", log_text)
+        self.assertIn("MARTI-I13", log_text)
 
 
 # ===========================================================================

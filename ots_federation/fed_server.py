@@ -31,6 +31,7 @@ from concurrent import futures
 
 import grpc
 
+from ots_federation.cert_identity import peer_fingerprint_from_grpc_context
 from ots_federation.proto import fig_pb2, fig_pb2_grpc
 
 
@@ -180,6 +181,20 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
         self._peer_addr_to_server_id: dict = {}
         self._peer_addr_lock = threading.Lock()
 
+        # Identity binding (bind federation ACL decisions to the authenticated
+        # peer certificate, not to a self-asserted wire field): policy is
+        # resolved by looking up the PRESENTED certificate's fingerprint in
+        # the registry's static, config-time fingerprint->peer_id table
+        # (populated from each peer's `fingerprint` config key — see
+        # manager.py._build_group_registry). There is deliberately no
+        # runtime/trust-on-first-use state here: a fingerprint either matches
+        # a configured peer or it does not. An earlier version of this fix
+        # used trust-on-first-use keyed on the wire-supplied serverId, which
+        # left a startup-race escalation (attacker pre-claims a configured
+        # serverId before the real peer connects) and a pre-claim DoS
+        # (attacker locks out the real peer for every configured identity).
+        # Never reintroduce a first-sight-binds-forever branch here.
+
     # ------------------------------------------------------------------
     # getIdentity (unary) — return OUR identity..
     # ------------------------------------------------------------------
@@ -208,26 +223,41 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
         ServerFederateGroupsStream) before falling back to context.peer().  On
         reconnects after the first ClientEventStream, the correct stanza key is
         used for group policy.
+
+        Identity is re-resolved on EVERY event, not once at stream-open: a
+        connecting peer typically opens ServerEventStream before its
+        ClientEventStream (which is what carries the Subscription that lets
+        the TCP→server_id map populate — see _register_peer_addr), so the
+        very first events on a fresh connection can arrive before that
+        mapping exists. Re-resolving per event means those first few events
+        may be evaluated against a not-yet-bound identity (correctly
+        conservative — quarantined until bound), while later events on the
+        same long-lived stream benefit from the mapping as soon as it lands,
+        rather than being stuck with whatever was resolved at connection open.
         """
         from ots_federation.codec import decode_federated_event  # pylint: disable=import-outside-toplevel
 
-        peer_id = self._resolve_peer_id(context)
         # A lightweight link object stands in as the router `src` for these
         # inbound events (router.route(src, evt)). It is NOT registered for
         # outbound fan-out — that is the ClientEventStream's job — but giving it
         # the peer's server_id lets on_outbound src-skip echo correctly if the
-        # same peer also has an outbound link registered.
+        # same peer also has an outbound link registered. peer_server_id is
+        # refreshed below as identity resolution firms up.
         inbound_src = _InboundPeerLink(
-            peer_server_id=peer_id,
+            peer_server_id=self._resolve_peer_id(context),
             node_id=self.server_id,
             default_max_hops=self.default_max_hops,
         )
 
-        self.lgr.info("ServerEventStream opened from peer %s", peer_id)
+        self.lgr.info("ServerEventStream opened from peer %s", inbound_src.peer_server_id)
         try:
             for fed_event_proto in request_iterator:
+                peer_id, quarantined = self._resolve_authenticated_peer(context)
+                inbound_src.peer_server_id = peer_id
                 try:
-                    evt, fed_meta = decode_federated_event(fed_event_proto)
+                    evt, fed_meta = decode_federated_event(
+                        fed_event_proto, local_max_hops=self.default_max_hops
+                    )
                 except Exception as exc:  # pylint: disable=broad-except
                     self.lgr.warning("Failed to decode inbound FederatedEvent: %s", exc)
                     continue
@@ -252,16 +282,23 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
                 # federatedGroupMapping off) never annotates federateGroups, and
                 # the registry admits those iff a wildcard accept_as exists
                 # (see module docstring: fail-closed for unmapped groups).
+                # A quarantined identity (unrecognized or identity-mismatched
+                # certificate — see _resolve_authenticated_peer) NEVER consults
+                # the registry at all: it gets nothing, not the global default.
                 if self.group_registry is not None:
                     remote_groups = list(fed_event_proto.federateGroups)
-                    local_groups = self.group_registry.map_inbound_groups(
-                        peer_id, remote_groups
-                    )
+                    if quarantined:
+                        local_groups = None
+                    else:
+                        local_groups = self.group_registry.map_inbound_groups(
+                            peer_id, remote_groups
+                        )
                     if local_groups is None:
                         self.lgr.debug(
                             "Inbound group policy: dropping event %s from peer %s "
-                            "(no mappable local groups for %s)",
+                            "(no mappable local groups for %s%s)",
                             getattr(evt, "uid", "?"), peer_id, remote_groups,
+                            " — quarantined identity" if quarantined else "",
                         )
                         continue
                     # Attach mapped local groups as sidecars.
@@ -295,11 +332,7 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
         it is stored in _peer_addr_to_server_id so that subsequent ServerEventStream
         calls on the same TCP connection can resolve the correct stanza key.
         """
-        peer_id = ""
-        if subscription is not None and subscription.HasField("identity"):
-            peer_id = subscription.identity.serverId
-        if not peer_id:
-            peer_id = self._peer_id_from_context(context)
+        peer_id, quarantined = self._resolve_authenticated_peer(context, subscription)
         # Register TCP→server_id so ServerEventStream can resolve this peer (1A).
         self._register_peer_addr(context, peer_id)
 
@@ -309,8 +342,21 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
             default_max_hops=self.default_max_hops,
             group_registry=self.group_registry,
         )
-        self.manager.register_inbound_link(peer_id, link)
-        self.lgr.info("ClientEventStream opened to peer %s (registered for fan-out)", peer_id)
+        if quarantined:
+            # Do NOT register this link for outbound fan-out: an unrecognized
+            # or identity-mismatched certificate gets no policy at all, which
+            # for the outbound direction means "never fanned events in the
+            # first place" rather than relying on a share_as lookup that would
+            # otherwise fall through to the global default for this identity.
+            self.lgr.warning(
+                "ClientEventStream opened by peer %s with no explicit "
+                "federation configuration (or a certificate that disagrees "
+                "with a previously-bound identity) — NOT registering for "
+                "outbound fan-out (quarantined)", peer_id,
+            )
+        else:
+            self.manager.register_inbound_link(peer_id, link)
+            self.lgr.info("ClientEventStream opened to peer %s (registered for fan-out)", peer_id)
 
         def _on_rpc_done():
             link.request_stop()
@@ -321,8 +367,12 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
             for proto in link.drain_outbound():
                 yield proto
         finally:
-            self.manager.deregister_inbound_link(peer_id, link)
-            self.lgr.info("ClientEventStream to peer %s closed (deregistered)", peer_id)
+            if not quarantined:
+                self.manager.deregister_inbound_link(peer_id, link)
+            self.lgr.info(
+                "ClientEventStream to peer %s closed%s", peer_id,
+                " (was quarantined, never registered)" if quarantined else " (deregistered)",
+            )
 
     # ------------------------------------------------------------------
     # HealthCheck (unary) — always SERVING..
@@ -344,7 +394,7 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
         Shortcut-1 Option-1A: uses _resolve_peer_id so announced groups are
         stored under the correct server_id key (not the TCP address).
         """
-        peer_id = self._resolve_peer_id(context)
+        peer_id, quarantined = self._resolve_authenticated_peer(context)
         try:
             for groups_msg in request_iterator:
                 remote_groups = list(groups_msg.federateGroups)
@@ -352,7 +402,7 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
                     "ClientFederateGroupsStream: peer %s announced groups %s",
                     peer_id, remote_groups,
                 )
-                if self.group_registry is not None:
+                if self.group_registry is not None and not quarantined:
                     self.group_registry.update_from_federate_groups(peer_id, remote_groups)
         except grpc.RpcError:
             pass
@@ -369,14 +419,14 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
         Shortcut-1 Option-1A: when server_id is resolved from the subscription,
         it is stored in _peer_addr_to_server_id alongside ClientEventStream.
         """
-        peer_id = ""
-        if subscription is not None and subscription.HasField("identity"):
-            peer_id = subscription.identity.serverId
-        if not peer_id:
-            peer_id = self._peer_id_from_context(context)
+        peer_id, _quarantined = self._resolve_authenticated_peer(context, subscription)
         # Register TCP→server_id so ServerEventStream can resolve this peer (1A).
         self._register_peer_addr(context, peer_id)
 
+        # NOTE: no quarantine gate needed here — reading self.group_registry.
+        # _outbound directly (not via map_outbound()) never consults the
+        # global default fallback in the first place, so an unrecognized
+        # peer_id already announces an empty group list.
         announced: list = []
         if self.group_registry is not None:
             out_map = self.group_registry._outbound.get(peer_id, {})
@@ -458,16 +508,21 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
     def SendOneEvent(self, request, context):  # noqa: N802
         """Single (non-streamed) event from the peer — decode + route, like ServerEventStream."""
         from ots_federation.codec import decode_federated_event  # pylint: disable=import-outside-toplevel
-        peer_id = self._peer_id_from_context(context)
+        peer_id, quarantined = self._resolve_authenticated_peer(context)
         try:
-            evt, fed_meta = decode_federated_event(request)
+            evt, fed_meta = decode_federated_event(
+                request, local_max_hops=self.default_max_hops
+            )
             if evt is not None:
                 # Apply inbound group policy (same as ServerEventStream).
                 # Group-less events consult the wildcard policy too (b39e05).
+                # A quarantined identity never reaches the registry (see
+                # ServerEventStream's comment on the same gate).
                 if self.group_registry is not None:
                     remote_groups = list(request.federateGroups)
-                    local_groups = self.group_registry.map_inbound_groups(
-                        peer_id, remote_groups
+                    local_groups = (
+                        None if quarantined
+                        else self.group_registry.map_inbound_groups(peer_id, remote_groups)
                     )
                     if local_groups is None:
                         self.lgr.debug(
@@ -547,6 +602,95 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
             return "unknown-peer"
         with self._peer_addr_lock:
             return self._peer_addr_to_server_id.get(tcp_addr, tcp_addr)
+
+    def _resolve_authenticated_peer(self, context, subscription=None):
+        """
+        Resolve this connection's federation identity SOLELY from the
+        certificate actually presented on the mTLS transport, never from a
+        self-asserted wire field — the fix for the group-ACL bypass where a
+        peer could pick its own policy by asserting a different serverId (or
+        another configured peer's serverId), or by asserting none at all and
+        landing on the global default.
+
+        Returns (peer_id, quarantined):
+          peer_id : str
+              The config-facing registry key this fingerprint resolves to
+              (the peer's declared server_id, or its provisional
+              address:port key — see FederationManager._build_group_registry
+              / FederateGroupRegistry.register_fingerprint). When quarantined,
+              this is a synthetic, never-configurable placeholder string
+              derived from the fingerprint itself — guaranteed not to
+              collide with any real configured peer_id — used only for
+              logging and outbound src-skip bookkeeping, NEVER for a
+              group-registry lookup (see quarantined below).
+          quarantined : bool
+              True when the presented certificate's fingerprint has no
+              matching entry in the registry's configured fingerprint table.
+              Callers MUST treat quarantined=True as "no policy" — never
+              consult group-policy defaults (including a deliberately
+              configured wildcard accept_as/share_as) for a quarantined
+              connection. An unrecognized or spoofed identity gets nothing;
+              it does not fall through to the most permissive config.
+
+        Resolution — deliberately has NO wire-supplied input anywhere in the
+        policy decision (Subscription.identity.serverId is not read here at
+        all; `subscription` is accepted only for the insecure-channel legacy
+        fallback below, kept for existing loopback/testing callers):
+          1. fingerprint = the SHA-256 fingerprint of the certificate
+             actually presented on THIS transport (via
+             context.auth_context()). None on an insecure channel (no mTLS
+             material configured — testing only; see FederationServer.start's
+             warning) or a context that exposes no verified certificate.
+          2. When fingerprint is None: nothing to bind identity to (insecure
+             channel). Fall back to the pre-identity-binding candidate-only
+             resolution (wire serverId, or the TCP-address-derived key) so
+             existing insecure-channel/local-dev unit tests keep working —
+             there is no ACL to bypass on an unauthenticated channel in the
+             first place.
+          3. When self.group_registry is None: no group policy configured at
+             all; nothing for a spoofed identity to bypass. Same legacy
+             fallback as (2).
+          4. Otherwise: look up `fingerprint` in
+             self.group_registry.resolve_peer_id_by_fingerprint(). A
+             configured match returns that peer_id, never quarantined. No
+             match means this certificate has no configuration ANYWHERE —
+             quarantine unconditionally. There is no trust-on-first-use, no
+             partial match, and no fallthrough to a declared server_id or
+             the global default: a fingerprint the operator never configured
+             gets nothing, full stop.
+        """
+        def _legacy_candidate() -> str:
+            candidate = ""
+            if subscription is not None and subscription.HasField("identity"):
+                candidate = subscription.identity.serverId
+            if not candidate:
+                candidate = self._resolve_peer_id(context)
+            return candidate
+
+        fingerprint = peer_fingerprint_from_grpc_context(context)
+        if fingerprint is None:
+            # No verified certificate on this transport — nothing to bind
+            # identity to (insecure/testing channel). Keep legacy behavior.
+            return _legacy_candidate(), False
+
+        if self.group_registry is None:
+            # No group policy configured at all; there is nothing for a
+            # spoofed identity to bypass. Keep legacy behavior.
+            return _legacy_candidate(), False
+
+        peer_id = self.group_registry.resolve_peer_id_by_fingerprint(fingerprint)
+        if peer_id is None:
+            self.lgr.debug(
+                "Identity binding: certificate fingerprint %s has no "
+                "configured peer (fingerprint absent from every "
+                "[federate:*] `fingerprint` key) — quarantining (no policy "
+                "applied, default NOT consulted, wire-supplied serverId NOT "
+                "consulted)",
+                fingerprint,
+            )
+            return f"unconfigured-cert:{fingerprint}", True
+
+        return peer_id, False
 
     def _our_subscription(self):
         """Build a Subscription with our identity and server version.

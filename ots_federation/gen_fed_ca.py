@@ -474,6 +474,16 @@ port = {listen_port}
 protocol = grpc
 # ca_cert: path where you saved fed-ca.crt from this bundle.
 ca_cert = /path/to/fed-ca.crt
+# fingerprint: REQUIRED for us to trust an inbound connection from this peer.
+# This is the SHA-256 fingerprint of the LEAF certificate "{server_id}"
+# actually presents on the mTLS handshake — group-ACL policy is resolved
+# from THIS value, never from anything the peer claims on the wire. Without
+# it, an inbound connection claiming to be "{server_id}" is quarantined
+# (no policy, not even the permissive accept_as/share_as below) regardless
+# of what identity string it presents. This is the exact value printed as
+# "leaf certificate fingerprint" in this bundle's README.md — copy it
+# verbatim (case-insensitive, colon-hex).
+fingerprint = {fingerprint}
 # accept_as / share_as: TIGHTEN to your real ACL group names before going
 # live — the wildcards below are permissive placeholders, not a
 # recommendation. See README.qmd "CoT Events Not Exchanged" for semantics.
@@ -526,7 +536,13 @@ federation CA certificate (public) and filled-in config templates.
 2. **Add the federate entry.**
    - ots-federation: paste `ots-federation-federate-stanza.ini` into your
      `federation.ini`, fill in `ca_cert` with the path from step 1, and
-     tighten `accept_as` / `share_as` to your real ACL groups.
+     tighten `accept_as` / `share_as` to your real ACL groups. **The
+     `fingerprint = {fingerprint}` line is REQUIRED, not optional** — without
+     it, an inbound connection claiming to be us is quarantined (no policy
+     at all) regardless of what identity it presents on the wire. This is
+     the same fingerprint-binding hardening as the TAK Server `id` attribute
+     below; ots-federation peers need the explicit key because there is no
+     equivalent implicit binding in the INI format.
    - Stock TAK Server: paste `takserver-federate-stanza.xml` inside your
      CoreConfig.xml `<federation>` element. **The `<inboundGroup>` /
      `<outboundGroup>` children are REQUIRED** — a `<federate>` entry without
@@ -563,9 +579,16 @@ def _leaf_fingerprint_sha256_colon_hex(cert: x509.Certificate) -> str:
     present during the mTLS handshake. With chain certs (leaf + CA, required
     for TAK Server FIG interop — see the module docstring's chain-cert quirk),
     that is peerCertificates[0], i.e. still the leaf, not the CA.
+
+    Delegates to ots_federation.cert_identity — the SAME formatter fed_server.py
+    uses to resolve a connecting peer's identity at runtime, so that
+    group-ACL decisions are always keyed on the authenticated certificate
+    identity. One implementation shared by both sides so the value printed
+    here always matches the value the servicer resolves for the same
+    certificate.
     """
-    digest = cert.fingerprint(hashes.SHA256())
-    return ":".join(f"{b:02X}" for b in digest)
+    from ots_federation.cert_identity import leaf_fingerprint_sha256_colon_hex
+    return leaf_fingerprint_sha256_colon_hex(cert)
 
 
 def _build_federate_coreconfig_xml(fingerprint: str, server_id: str, address: str, listen_port: int) -> str:
@@ -693,7 +716,10 @@ def cmd_export(argv, prog="ots-fed-certs export"):
 
     # 2. ots-federation INI stanza template.
     ini_stanza = _EXPORT_INI_TEMPLATE.format(
-        server_id=server_id, address=args.our_address, listen_port=args.listen_port
+        server_id=server_id,
+        address=args.our_address,
+        listen_port=args.listen_port,
+        fingerprint=fingerprint,
     )
     ini_path = os.path.join(out_dir, "ots-federation-federate-stanza.ini")
     with open(ini_path, "w") as f:

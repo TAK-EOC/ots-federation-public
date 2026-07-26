@@ -89,6 +89,14 @@ class FederateGroupRegistry:
         with the remote group name used as the local group name (string passthrough).
         Opt-in only. Default False.
         Equivalent to TAK Server's fallbackWhenNoGroupMappings=true.
+    _fingerprint_to_peer : Dict[str, str]
+        {normalized_fingerprint_colon_hex: peer_id} — the ONLY table inbound
+        identity binding resolves against. Populated at config-parse time
+        from each peer's `fingerprint` key, never from anything observed
+        on the wire. A connecting
+        certificate whose fingerprint is absent from this table has no
+        peer_id to resolve to at all — the caller (fed_server.py) must
+        quarantine, never fall through to a default.
     """
 
     def __init__(self):
@@ -106,6 +114,10 @@ class FederateGroupRegistry:
         # configured" → preserve block-unmapped behaviour..
         self._default_inbound: Optional[Dict[str, Optional[str]]] = None
         self._default_outbound: Optional[Dict[str, str]] = None
+        # {normalized_fingerprint_colon_hex: peer_id} — config-time only, see
+        # class docstring. Keys are already normalized (upper-case colon-hex)
+        # by config.py before register_fingerprint is called.
+        self._fingerprint_to_peer: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -198,40 +210,117 @@ class FederateGroupRegistry:
                 table[out_key] = e.remote_group
         self._default_outbound = table
 
+    def register_fingerprint(self, fingerprint: str, peer_id: str) -> None:
+        """
+        Register a configured peer's certificate fingerprint → peer_id.
+
+        Called by FederationManager._build_group_registry at config-parse
+        time from each peer's `fingerprint` config key. This is the ONLY
+        table fed_server.py's inbound identity binding may resolve a
+        connecting certificate against — never a wire-supplied field.
+
+        Parameters
+        ----------
+        fingerprint : str
+            Normalized (upper-case colon-hex) SHA-256 fingerprint —
+            config.py normalizes before calling this.
+        peer_id : str
+            The registry key this fingerprint resolves to (the peer's
+            declared server_id when set, else its provisional
+            "address:port" key — whichever key add_peer_map registered
+            this peer's group tables under).
+        """
+        if not fingerprint:
+            return
+        self._fingerprint_to_peer[fingerprint] = peer_id
+
+    def resolve_peer_id_by_fingerprint(self, fingerprint: str) -> Optional[str]:
+        """
+        Resolve a connecting certificate's fingerprint to a configured
+        peer_id, or None if no peer configured this fingerprint.
+
+        Callers (fed_server.py) MUST treat None as "quarantine" — no policy,
+        no fallthrough to a global default. There is no partial match: a
+        fingerprint either exactly matches a configured peer or it does not.
+
+        Parameters
+        ----------
+        fingerprint : str
+            Normalized (upper-case colon-hex) SHA-256 fingerprint, as
+            produced by cert_identity.peer_fingerprint_from_grpc_context.
+
+        Returns
+        -------
+        str | None
+        """
+        return self._fingerprint_to_peer.get(fingerprint)
+
+    def known_fingerprints(self) -> List[str]:
+        """Return all configured peer certificate fingerprints. Diagnostics only."""
+        return sorted(self._fingerprint_to_peer)
+
     def rekey_peer(self, old_id: str, new_id: str) -> None:
         """
         Re-key all per-peer registry entries from old_id to new_id.
 
-        Called by FederateClient once getIdentity returns the real
-        server_id, replacing the provisional "address:port" key that
-        _build_group_registry used at startup.  This fixes the key
-        mismatch between address:port (config time) and server_id (runtime).
-         §key-consistency.
+        DEFENSE-IN-DEPTH ONLY: FederateClient no longer calls this at
+        all — the outbound session's policy key is
+        resolved exclusively from the dialed server's presented certificate
+        fingerprint via resolve_peer_id_by_fingerprint (the same table the
+        inbound path uses), so there is no wire-derived rekey on any
+        production path. The method (and its collision guard below) is kept
+        so that no future caller can be handed a remote-controlled new_id
+        and silently destroy or capture another peer's tables. This method
+        itself does not, and must not, trust its caller's honesty about
+        what new_id means. §key-consistency.
 
         If old_id == new_id or old_id is not in the registry, this is a
         no-op (safe to call unconditionally).
+
+        COLLISION SAFETY: if new_id ALREADY has an entry in any
+        table — i.e. new_id is some OTHER configured peer's key, not merely
+        this peer's own previously-provisional key — this is a collision,
+        not a legitimate rekey, and is refused outright. The old behavior
+        popped (deleted) old_id's entry unconditionally and only skipped the
+        overwrite, which silently destroyed old_id's own restrictive policy
+        for no benefit while leaving new_id's (the collided-with peer's)
+        table completely intact — exactly the shape a peer claiming another
+        peer's server_id would produce. Refusing the whole operation on
+        collision means BOTH keys keep their original entries untouched, and
+        the caller's own peer_id (old_id) still resolves to its own policy
+        rather than silently losing it.
 
         Parameters
         ----------
         old_id : str
             The provisional key used at startup (e.g. "10.0.0.1:9100").
         new_id : str
-            The peer's real federation server_id from getIdentity.
+            The key to move the entries to. Must never be a wire-reported
+            value — no production path passes one anymore (see above).
         """
         if old_id == new_id or not old_id:
             return
+
+        collision = (
+            new_id in self._inbound
+            or new_id in self._outbound
+            or new_id in self._fallback_allow
+        )
+        if collision:
+            log.warning(
+                "rekey_peer: refusing to rekey %r -> %r — %r already has its "
+                "own registered policy (collision); leaving both entries "
+                "untouched rather than destroying either one",
+                old_id, new_id, new_id,
+            )
+            return
+
         if old_id in self._inbound:
-            # Merge: if new_id already has an entry, old wins (explicit config).
-            existing = self._inbound.pop(old_id)
-            if new_id not in self._inbound:
-                self._inbound[new_id] = existing
+            self._inbound[new_id] = self._inbound.pop(old_id)
         if old_id in self._outbound:
-            existing_out = self._outbound.pop(old_id)
-            if new_id not in self._outbound:
-                self._outbound[new_id] = existing_out
+            self._outbound[new_id] = self._outbound.pop(old_id)
         if old_id in self._fallback_allow:
-            val = self._fallback_allow.pop(old_id)
-            self._fallback_allow.setdefault(new_id, val)
+            self._fallback_allow[new_id] = self._fallback_allow.pop(old_id)
 
     def map_inbound(self, peer_id: str, remote_group: str) -> Optional[str]:
         """

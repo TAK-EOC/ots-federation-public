@@ -425,7 +425,7 @@ class TestHandleInboundSidecar(unittest.TestCase):
         evt.point = models.Point(lat=0.0, lon=0.0, hae=0.0, ce=9999999.0, le=9999999.0)
         from ots_federation.codec import FedMeta
         fed_meta = FedMeta(seen_server_ids=[], current_hops=0)
-        return lambda proto: (evt, fed_meta), evt
+        return lambda proto, **_kwargs: (evt, fed_meta), evt
 
     # I10 — sidecars set when group policy allows
     def test_sidecars_set_on_allowed_inbound_event(self):

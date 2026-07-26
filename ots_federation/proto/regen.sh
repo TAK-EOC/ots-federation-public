@@ -14,13 +14,13 @@
 #   grpcio-tools 1.72.x+ switch to protobuf 6.33.6 and generate
 #   ValidateProtobufRuntimeVersion(6, 33, 6, ...) — incompatible with runtime 6.33.1.
 #   DO NOT upgrade grpcio-tools past 1.71.x unless OTS's protobuf pin also moves.
-#   See ticket 25b4aa for root-cause analysis.
+#   See git history for the root-cause analysis behind this constraint.
 #
 # Build deps (pinned, build-time only — NOT runtime):
 #   grpcio-tools==1.71.0  (brings protobuf==5.29.6; emits gencode version 5.29.0)
 #
 # Usage:
-#   cd <repo root>
+#   cd <ots-federation-plugin repo root>
 #   python3 -m venv /tmp/proto-regen-venv
 #   source /tmp/proto-regen-venv/bin/activate
 #   pip install grpcio-tools==1.71.0

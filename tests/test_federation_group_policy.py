@@ -976,6 +976,93 @@ class TestDefaultGroupPolicy(unittest.TestCase):
             self.fail(f"rekey_peer raised unexpectedly: {exc!r}")
 
     # ------------------------------------------------------------------
+    # (e) rekey_peer collision safety: a dialed peer answering getIdentity
+    #     with ANOTHER configured peer's server_id must never inherit that
+    #     peer's group policy, and must never destroy its own policy trying.
+    # ------------------------------------------------------------------
+
+    def test_rekey_peer_refuses_collision_with_another_configured_peer(self):
+        """
+        NEGATIVE assertion: if new_id already has its OWN registered policy
+        (a real, separately-configured peer -- e.g. victim-peer), rekey_peer
+        must refuse the whole operation, not silently discard old_id's entry
+        while leaving new_id's untouched. This is the exact identity-theft
+        exploit shape: a dialed peer (attacker) answers getIdentity claiming
+        victim-peer's server_id, hoping to inherit victim-peer's policy.
+        """
+        reg = FederateGroupRegistry()
+        # victim-peer: a real, separately-configured peer with its own policy.
+        reg.add_peer_map(FederatePeerGroupMap("victim-peer", "in", "SECRET", "SECRET"))
+        reg.add_peer_map(FederatePeerGroupMap("victim-peer", "out", "SECRET", "SECRET"))
+        # attacker-provisional: the dialed peer's OWN provisional entry,
+        # scoped to something much less sensitive.
+        reg.add_peer_map(FederatePeerGroupMap("10.0.0.66:9100", "in", "FIRE-OPS", "FIRE-OPS"))
+
+        # Attacker's getIdentity() claims to be "victim-peer".
+        reg.rekey_peer("10.0.0.66:9100", "victim-peer")
+
+        # victim-peer's OWN policy must be completely untouched.
+        self.assertEqual(
+            reg.map_inbound("victim-peer", "SECRET"), "SECRET",
+            "victim-peer's policy must survive a colliding rekey attempt untouched",
+        )
+        self.assertEqual(reg.map_outbound("victim-peer", "SECRET"), "SECRET")
+        # The attacker's own provisional entry must ALSO survive (not popped) --
+        # refusing the whole operation, not just skipping the overwrite.
+        self.assertEqual(
+            reg.map_inbound("10.0.0.66:9100", "FIRE-OPS"), "FIRE-OPS",
+            "a refused rekey must leave the OLD key's entry in place too, "
+            "not silently discard it",
+        )
+        # And the attacker's own scoped policy must NOT have leaked onto
+        # victim-peer's key either.
+        self.assertIsNone(reg.map_inbound("victim-peer", "FIRE-OPS"))
+
+    def test_rekey_peer_refuses_collision_on_outbound_only_table(self):
+        """Collision detection checks the outbound table too, not just inbound."""
+        reg = FederateGroupRegistry()
+        reg.add_peer_map(FederatePeerGroupMap("victim-peer", "out", "White", "White"))
+        reg.add_peer_map(FederatePeerGroupMap("10.0.0.1:9100", "out", "Cyan", "Cyan"))
+
+        reg.rekey_peer("10.0.0.1:9100", "victim-peer")
+
+        self.assertEqual(reg.map_outbound("victim-peer", "White"), "White")
+        self.assertEqual(reg.map_outbound("10.0.0.1:9100", "Cyan"), "Cyan")
+
+    def test_rekey_peer_refuses_collision_on_fallback_allow_table(self):
+        """Collision detection also covers the fallback_allow table."""
+        reg = FederateGroupRegistry()
+        reg.set_fallback_allow("victim-peer", True)
+        reg.add_peer_map(FederatePeerGroupMap("10.0.0.1:9100", "in", "X", "X"))
+
+        reg.rekey_peer("10.0.0.1:9100", "victim-peer")
+
+        # victim-peer's fallback flag must be untouched; the attacker's
+        # provisional entry must still be present under its own key.
+        self.assertTrue(reg._fallback_allow.get("victim-peer"))
+        self.assertEqual(reg.map_inbound("10.0.0.1:9100", "X"), "X")
+
+    def test_rekey_peer_still_succeeds_when_no_collision(self):
+        """
+        Non-collision rekey (the normal, legitimate case -- new_id has no
+        prior entry anywhere) still works exactly as before: this is a
+        regression guard that the collision-safety fix didn't break the
+        ordinary provisional-id -> real-server_id rekey path.
+        """
+        reg = FederateGroupRegistry()
+        reg.add_peer_map(FederatePeerGroupMap("10.0.0.1:9100", "in", "White", "White"))
+        reg.add_peer_map(FederatePeerGroupMap("10.0.0.1:9100", "out", "White", "White"))
+        reg.set_fallback_allow("10.0.0.1:9100", True)
+
+        reg.rekey_peer("10.0.0.1:9100", "real-server-id-xyz")
+
+        self.assertEqual(reg.map_inbound("real-server-id-xyz", "White"), "White")
+        self.assertEqual(reg.map_outbound("real-server-id-xyz", "White"), "White")
+        self.assertTrue(reg._fallback_allow.get("real-server-id-xyz"))
+        # Old provisional key is gone (genuinely rekeyed, not left behind).
+        self.assertIsNone(reg.map_inbound("10.0.0.1:9100", "White"))
+
+    # ------------------------------------------------------------------
     # End-to-end: FederationManager default policy from config
     # ------------------------------------------------------------------
     def test_manager_wires_default_policy_from_config(self):
@@ -1044,6 +1131,364 @@ class TestDefaultGroupPolicy(unittest.TestCase):
         )
 
         mgr.bridge.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. Identity binding: group-ACL decisions keyed on the authenticated mTLS
+#    certificate, never on a self-asserted wire field.
+# ---------------------------------------------------------------------------
+
+def _make_test_cert_pem(cn="identity-binding-test"):
+    """Build a throwaway self-signed certificate and return its PEM bytes."""
+    from ots_federation.gen_fed_ca import generate_ca
+    from cryptography.hazmat.primitives import serialization
+
+    _key, cert = generate_ca(cn=cn, org="ots-test", validity_days=1)
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def _fingerprint_of(pem_bytes):
+    """Compute the canonical colon-hex SHA-256 fingerprint of a test cert's PEM."""
+    from ots_federation.cert_identity import fingerprint_from_pem
+    return fingerprint_from_pem(pem_bytes)
+
+
+def _mock_secure_context(peer_addr, pem_bytes):
+    """MagicMock ServicerContext exposing a real certificate via auth_context()."""
+    ctx = MagicMock()
+    ctx.peer.return_value = peer_addr
+    ctx.auth_context.return_value = {"x509_pem_cert": [pem_bytes]}
+    return ctx
+
+
+def _mock_insecure_context(peer_addr):
+    """MagicMock ServicerContext with no usable auth_context (legacy/testing path)."""
+    ctx = MagicMock()
+    ctx.peer.return_value = peer_addr
+    # Deliberately do NOT configure auth_context — a bare MagicMock's return
+    # value fails cert_identity's isinstance/parse checks, which is exactly
+    # what an insecure test channel looks like from the servicer's view.
+    return ctx
+
+
+class TestCertFingerprintIdentityBinding(unittest.TestCase):
+    """
+    _resolve_authenticated_peer binds group-registry lookups SOLELY to a
+    CONFIGURED fingerprint->peer_id table -- corrected implementation after
+    the first attempt's trust-on-first-use approach was rejected in
+    verification.
+
+    Every test here registers the presented cert's ACTUAL fingerprint (never
+    a made-up string) via reg.register_fingerprint, mirroring how
+    manager.py._build_group_registry populates the table from each peer's
+    configured `fingerprint` key. Subscription.identity.serverId is either
+    absent or deliberately WRONG in several tests specifically to prove it is
+    never consulted for the policy decision.
+    """
+
+    def _make_servicer(self, registry=None):
+        from ots_federation.fed_server import FederatedChannelServicer
+
+        bridge = FederationBridge()
+        manager = MagicMock()
+        manager.register_inbound_link = MagicMock()
+        manager.deregister_inbound_link = MagicMock()
+        servicer = FederatedChannelServicer(
+            server_id="TAKY-SERVER",
+            server_name="Test Server",
+            bridge=bridge,
+            manager=manager,
+            default_max_hops=3,
+            group_registry=registry,
+        )
+        return servicer, manager
+
+    def _sub(self, server_id):
+        return fig_pb2.Subscription(identity=fig_pb2.Identity(serverId=server_id))
+
+    # --- Positive: a fingerprint configured for a peer resolves to that peer ---
+
+    def test_configured_fingerprint_resolves_to_its_peer(self):
+        """
+        A cert whose fingerprint was registered for "known-peer" resolves to
+        "known-peer" and is never quarantined -- the Subscription serverId
+        doesn't even need to match (it isn't consulted at all).
+        """
+        pem = _make_test_cert_pem()
+        fp = _fingerprint_of(pem)
+        reg = _registry_with("known-peer", in_pairs={"White": "White"})
+        reg.register_fingerprint(fp, "known-peer")
+        servicer, _mgr = self._make_servicer(reg)
+        ctx = _mock_secure_context("ipv4:10.0.0.5:1234", pem)
+
+        # Subscription claims something else entirely -- must be irrelevant.
+        peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx, self._sub("this-is-not-consulted")
+        )
+        self.assertEqual(peer_id, "known-peer")
+        self.assertFalse(
+            quarantined,
+            "a certificate whose fingerprint is configured for a peer must "
+            "be trusted regardless of what serverId it claims on the wire",
+        )
+
+    def test_configured_fingerprint_resolves_with_no_subscription_at_all(self):
+        """ServerEventStream/SendOneEvent-style calls pass subscription=None;
+        fingerprint resolution must not depend on a Subscription being present."""
+        pem = _make_test_cert_pem()
+        fp = _fingerprint_of(pem)
+        reg = _registry_with("known-peer", in_pairs={"White": "White"})
+        reg.register_fingerprint(fp, "known-peer")
+        servicer, _mgr = self._make_servicer(reg)
+        ctx = _mock_secure_context("ipv4:10.0.0.5:1234", pem)
+
+        peer_id, quarantined = servicer._resolve_authenticated_peer(ctx, None)
+        self.assertEqual(peer_id, "known-peer")
+        self.assertFalse(quarantined)
+
+    # --- NEGATIVE (a): fingerprint NOT configured -- quarantine, no default ---
+
+    def test_unconfigured_fingerprint_is_quarantined_even_with_permissive_default(self):
+        """
+        NEGATIVE assertion: a certificate whose fingerprint has NO entry in
+        the registry's fingerprint table is quarantined even when a
+        permissive global default (accept_as=*:__ANON__ equivalent) is
+        configured -- it must NEVER inherit that default. This is the H-1
+        exploit surface: an unconfigured certificate must get nothing, not
+        the most permissive available policy.
+        """
+        reg = FederateGroupRegistry()
+        from ots_federation.groups import parse_group_map
+        # A permissive global default IS configured...
+        reg.set_default_in_map(parse_group_map("*:__ANON__", "in"))
+        # ...but this certificate's fingerprint was never registered anywhere.
+        servicer, _mgr = self._make_servicer(reg)
+        pem = _make_test_cert_pem()
+        ctx = _mock_secure_context("ipv4:10.0.0.9:4444", pem)
+
+        peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx, self._sub("totally-unconfigured-identity")
+        )
+        self.assertTrue(
+            quarantined,
+            "a certificate with no configured fingerprint must be "
+            "quarantined, never handed the global default policy",
+        )
+
+        # Confirm the caller-side contract too: ServerEventStream must not
+        # consult map_inbound_groups at all when quarantined (it would
+        # otherwise return {'__ANON__'} from the default above).
+        local_groups = (
+            None if quarantined
+            else reg.map_inbound_groups(peer_id, [])
+        )
+        self.assertIsNone(
+            local_groups,
+            "quarantined identity must resolve to no groups, not the "
+            "configured default (__ANON__)",
+        )
+
+    def test_unconfigured_fingerprint_with_no_default_is_also_quarantined(self):
+        """Same as above but with no default configured at all -- still quarantined."""
+        reg = FederateGroupRegistry()  # nothing configured anywhere
+        servicer, _mgr = self._make_servicer(reg)
+        pem = _make_test_cert_pem()
+        ctx = _mock_secure_context("ipv4:10.0.0.9:4444", pem)
+
+        _peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx, self._sub("nobody-configured-this")
+        )
+        self.assertTrue(quarantined)
+
+    # --- NEGATIVE (b): unconfigured fingerprint, but serverId MATCHES a real
+    #     peer -- must still quarantine. This is the exact H-1 escalation:
+    #     asserting a configured peer's identity string on an unrelated cert.
+
+    def test_unconfigured_fingerprint_claiming_a_real_peers_server_id_is_quarantined(self):
+        """
+        NEGATIVE assertion: an attacker's certificate (never registered
+        anywhere) that asserts Subscription.identity.serverId == a REAL
+        configured peer's name must still be quarantined -- serverId is
+        never consulted for the policy decision, only the fingerprint is.
+        """
+        reg = _registry_with("victim-peer", in_pairs={"SECRET": "SECRET"})
+        victim_pem = _make_test_cert_pem(cn="victim-real-cert")
+        reg.register_fingerprint(_fingerprint_of(victim_pem), "victim-peer")
+
+        attacker_pem = _make_test_cert_pem(cn="attacker-cert")  # NOT registered
+        servicer, _mgr = self._make_servicer(reg)
+        ctx = _mock_secure_context("ipv4:10.0.0.66:6666", attacker_pem)
+
+        peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx, self._sub("victim-peer")  # <-- claims the victim's name
+        )
+        self.assertTrue(
+            quarantined,
+            "a certificate not configured for ANY peer must be quarantined "
+            "even when it claims a real, configured peer's serverId",
+        )
+        local_groups = (
+            None if quarantined
+            else reg.map_inbound_groups(peer_id, ["SECRET"])
+        )
+        self.assertIsNone(
+            local_groups,
+            "the attacker's connection must never receive the victim's "
+            "SECRET group policy",
+        )
+
+    # --- NEGATIVE (c): a DIFFERENT cert claiming a configured peer's serverId
+    #     is quarantined -- covers the same escalation with the real peer's
+    #     own cert not yet having connected in this process at all (no
+    #     trust-on-first-use state exists anymore, so there is no race).
+
+    def test_different_cert_claiming_configured_peers_identity_is_quarantined(self):
+        """
+        A certificate that is simply not THIS peer's registered fingerprint
+        is quarantined regardless of claimed identity -- verified with two
+        DIFFERENT certs, neither of which happens to be the one registered
+        for "shared-name".
+        """
+        reg = _registry_with("shared-name", in_pairs={"FIRE-OPS": "FIRE-OPS"})
+        real_pem = _make_test_cert_pem(cn="the-real-shared-name-cert")
+        reg.register_fingerprint(_fingerprint_of(real_pem), "shared-name")
+
+        impostor_pem = _make_test_cert_pem(cn="impostor-cert")
+        servicer, _mgr = self._make_servicer(reg)
+        ctx = _mock_secure_context("ipv4:10.0.0.2:2222", impostor_pem)
+
+        peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx, self._sub("shared-name")
+        )
+        self.assertTrue(
+            quarantined,
+            "a certificate other than the one configured for this peer "
+            "must be refused even when it presents the matching serverId",
+        )
+
+    def test_no_persistent_state_across_repeated_unconfigured_attempts(self):
+        """
+        Regression guard for the rejected first attempt's pre-claim DoS:
+        resolution is a pure, stateless config lookup now -- repeatedly
+        presenting DIFFERENT unconfigured certificates claiming the SAME
+        serverId never binds, never locks out a later legitimate cert, and
+        never changes behavior between calls.
+        """
+        real_pem = _make_test_cert_pem(cn="the-real-peer-cert")
+        reg = _registry_with("contested-name", in_pairs={"White": "White"})
+        reg.register_fingerprint(_fingerprint_of(real_pem), "contested-name")
+        servicer, _mgr = self._make_servicer(reg)
+
+        # Three different attacker certs, all claiming "contested-name",
+        # none of them registered -- all quarantined, none of them "sticks".
+        for i in range(3):
+            attacker_pem = _make_test_cert_pem(cn=f"attacker-{i}")
+            ctx = _mock_secure_context(f"ipv4:10.0.0.{i}:1111", attacker_pem)
+            _peer_id, quarantined = servicer._resolve_authenticated_peer(
+                ctx, self._sub("contested-name")
+            )
+            self.assertTrue(quarantined, f"attacker attempt #{i} must be quarantined")
+
+        # The REAL peer's cert, arriving after three attacker attempts,
+        # must still resolve cleanly -- no pre-claim lockout is possible.
+        ctx_real = _mock_secure_context("ipv4:10.0.0.99:9999", real_pem)
+        peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx_real, self._sub("contested-name")
+        )
+        self.assertEqual(peer_id, "contested-name")
+        self.assertFalse(
+            quarantined,
+            "the real peer's configured certificate must never be locked "
+            "out by prior unconfigured attempts (no TOFU state to poison)",
+        )
+
+    def test_same_cert_reconnecting_stays_trusted(self):
+        """The SAME configured certificate reconnecting is trusted every time."""
+        pem = _make_test_cert_pem()
+        reg = _registry_with("stable-peer", in_pairs={"White": "White"})
+        reg.register_fingerprint(_fingerprint_of(pem), "stable-peer")
+        servicer, _mgr = self._make_servicer(reg)
+
+        for i in range(3):
+            ctx = _mock_secure_context(f"ipv4:10.0.0.1:{5000 + i}", pem)
+            peer_id, quarantined = servicer._resolve_authenticated_peer(
+                ctx, self._sub("stable-peer")
+            )
+            self.assertEqual(peer_id, "stable-peer")
+            self.assertFalse(quarantined, f"reconnect #{i} must stay trusted")
+
+    # --- Legacy/insecure-channel fallback: no cert to bind to ---
+
+    def test_no_certificate_falls_back_to_legacy_resolution(self):
+        """
+        An insecure channel (no verified peer certificate available) has
+        nothing to bind identity to, so resolution falls back to the
+        pre-fix candidate-only behavior rather than quarantining every
+        insecure/test connection.
+        """
+        reg = _registry_with("legacy-peer", in_pairs={"White": "White"})
+        servicer, _mgr = self._make_servicer(reg)
+        ctx = _mock_insecure_context("ipv4:10.0.0.1:9999")
+
+        peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx, self._sub("legacy-peer")
+        )
+        self.assertEqual(peer_id, "legacy-peer")
+        self.assertFalse(quarantined)
+
+    def test_no_group_registry_configured_skips_binding_entirely(self):
+        """With group policy disabled entirely, identity binding is a no-op
+        (nothing for a spoofed identity to bypass)."""
+        servicer, _mgr = self._make_servicer(registry=None)
+        pem = _make_test_cert_pem()
+        ctx = _mock_secure_context("ipv4:10.0.0.1:1234", pem)
+
+        peer_id, quarantined = servicer._resolve_authenticated_peer(
+            ctx, self._sub("anything")
+        )
+        self.assertEqual(peer_id, "anything")
+        self.assertFalse(quarantined)
+
+    # --- ClientEventStream integration: quarantined peer gets no fan-out ---
+
+    def test_client_event_stream_does_not_register_quarantined_peer(self):
+        """
+        ClientEventStream must NOT register an outbound fan-out link for a
+        quarantined peer -- otherwise the outbound direction would inherit
+        whatever the (bypassed) default policy permits.
+        """
+        reg = FederateGroupRegistry()  # nothing configured -> any cert is unknown
+        servicer, manager = self._make_servicer(reg)
+        pem = _make_test_cert_pem()
+        ctx = _mock_secure_context("ipv4:10.0.0.1:1234", pem)
+        # Fire the RPC-done callback as soon as the servicer registers it, the
+        # way gRPC does when a stream ends. That sets the link's stop event, so
+        # drain_outbound() exits at once. The registration decision under test
+        # runs before that loop, so it has already happened by then.
+        ctx.add_callback.side_effect = lambda cb: cb()
+        sub = self._sub("unconfigured-walkup-peer")
+
+        list(servicer.ClientEventStream(sub, ctx))
+
+        manager.register_inbound_link.assert_not_called()
+
+    def test_client_event_stream_registers_known_peer(self):
+        """A cert with a configured fingerprint IS registered for outbound fan-out."""
+        pem = _make_test_cert_pem()
+        reg = _registry_with("dial-in-peer", out_pairs={"White": "White"})
+        reg.register_fingerprint(_fingerprint_of(pem), "dial-in-peer")
+        servicer, manager = self._make_servicer(reg)
+        ctx = _mock_secure_context("ipv4:10.0.0.1:1234", pem)
+        # Fire the RPC-done callback immediately (see the quarantine test above)
+        # so drain_outbound() exits once registration has been decided.
+        ctx.add_callback.side_effect = lambda cb: cb()
+        sub = self._sub("dial-in-peer")
+
+        list(servicer.ClientEventStream(sub, ctx))
+
+        manager.register_inbound_link.assert_called_once()
+        called_peer_id = manager.register_inbound_link.call_args[0][0]
+        self.assertEqual(called_peer_id, "dial-in-peer")
 
 
 if __name__ == "__main__":
