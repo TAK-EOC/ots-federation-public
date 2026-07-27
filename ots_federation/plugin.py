@@ -30,7 +30,7 @@ import sys
 import time
 import traceback
 
-from flask import Blueprint, Flask, jsonify, request
+from flask import Blueprint, Flask, jsonify, redirect, request, send_file, url_for
 
 # Conditionally inherit from OTS Plugin base class.
 # When ots-federation is installed inside the OTS venv, this import succeeds
@@ -81,6 +81,35 @@ _WATCHDOG_JOB_ID = "federation_watchdog"
 _WATCHDOG_INTERVAL_S = 30
 _STOP_WAIT_S = 10
 
+# Must equal importlib.metadata Name (pyproject.toml [project].name), lower-
+# cased — this is the string OTS's PluginManager keys plugins under
+# (`self.plugins[plugin.distro.lower()]`) and the string OTS's own web UI
+# uses to build both the settings-tab fetch and the plugin-UI iframe src:
+# `/api/plugins/${distro}/ui` (see OpenTAKServer-UI src/pages/Plugin.tsx).
+# Confirmed against docs.opentakserver.io/plugins.html and the reference
+# OTS-SkyFi-Plugin implementation — every plugin route must live under this
+# exact prefix or neither the Settings tab nor the UI iframe will find it.
+DISTRO = "ots-federation"
+API_PREFIX = f"/api/plugins/{DISTRO}"
+
+
+def _admin_only(fn):
+    """
+    Restrict a route to logged-in OTS administrators.
+
+    Thin wrapper around flask_security.roles_accepted("administrator") — the
+    same decorator OTS core's own plugin routes use (opentakserver/blueprints/
+    ots_api/plugin_api.py) and the reference OTS-SkyFi-Plugin UI routes use.
+    Falls back to a no-op outside the OTS venv (unit tests, dev) so this
+    module keeps importing cleanly without a hard flask_security dependency
+    at import time.
+    """
+    try:
+        from flask_security import roles_accepted  # type: ignore[import]
+        return roles_accepted("administrator")(fn)
+    except ImportError:  # pragma: no cover — only absent outside OTS venv
+        return fn
+
 
 def _get_default_fed_config_path(app) -> str:
     """Return the federation.ini path from config or fallback to data folder."""
@@ -125,6 +154,8 @@ class FederationPlugin(_OtsPlugin):
         self._proc: subprocess.Popen | None = None
         self._start_time: float | None = None
         self._restart_count: int = 0
+        self._fed_cfg_path: str | None = None
+        self._rmq_env: dict | None = None
 
     # ------------------------------------------------------------------
     # Plugin lifecycle (OTS calls these)
@@ -172,13 +203,29 @@ class FederationPlugin(_OtsPlugin):
         self.load_metadata()
         self._load_default_config(app)
 
+        # Resolved unconditionally, before any early return: the admin UI's
+        # "generate federation.ini" flow and restart() both need this even
+        # when the plugin is disabled or the file doesn't exist yet — those
+        # are recoverable states (operator hasn't run quickstart yet), not a
+        # permanent shutdown.
+        self._fed_cfg_path = _get_default_fed_config_path(app)
+        self._rmq_env = {
+            **os.environ,
+            "OTS_RMQHOST": str(app.config.get("OTS_RABBITMQ_SERVER_ADDRESS", "127.0.0.1")),
+            "OTS_RMQPORT": str(app.config.get("OTS_RABBITMQ_PORT", 5672)),
+            "OTS_RMQUSER": str(app.config.get("OTS_RABBITMQ_USERNAME", "guest")),
+            "OTS_RMQPASS": str(app.config.get("OTS_RABBITMQ_PASSWORD", "guest")),
+            "OTS_FED_LOG_LEVEL": str(app.config.get("OTS_FEDERATION_LOG_LEVEL", "INFO")),
+            "OTS_FED_DBURI": str(app.config.get("SQLALCHEMY_DATABASE_URI", "")),
+        }
+
         if not enabled:
             ots_logger.info("FederationPlugin is disabled; not starting engine")
             self._build_blueprint()
             return
 
         # Validate that federation.ini exists before spawning.
-        fed_cfg_path = _get_default_fed_config_path(app)
+        fed_cfg_path = self._fed_cfg_path
         if not os.path.exists(fed_cfg_path):
             ots_logger.warning(
                 "FederationPlugin: federation config not found at %s; "
@@ -187,27 +234,6 @@ class FederationPlugin(_OtsPlugin):
             )
             self._build_blueprint()
             return
-
-        # Extract RabbitMQ credentials from OTS app.config (never from CLI args).
-        rmq_host = str(app.config.get("OTS_RABBITMQ_SERVER_ADDRESS", "127.0.0.1"))
-        rmq_port = str(app.config.get("OTS_RABBITMQ_PORT", 5672))
-        rmq_user = str(app.config.get("OTS_RABBITMQ_USERNAME", "guest"))
-        rmq_pass = str(app.config.get("OTS_RABBITMQ_PASSWORD", "guest"))
-
-        self._rmq_env = {
-            **os.environ,
-            "OTS_RMQHOST": rmq_host,
-            "OTS_RMQPORT": rmq_port,
-            "OTS_RMQUSER": rmq_user,
-            "OTS_RMQPASS": rmq_pass,
-            # PY-31: pass the runtime-tunable log level down to the engine child.
-            "OTS_FED_LOG_LEVEL": str(
-                app.config.get("OTS_FEDERATION_LOG_LEVEL", "INFO")
-            ),
-            # Authoritative DB URI for synchronous group resolution.
-            "OTS_FED_DBURI": str(app.config.get("SQLALCHEMY_DATABASE_URI", "")),
-        }
-        self._fed_cfg_path = fed_cfg_path
 
         try:
             self._spawn_engine(ots_logger)
@@ -256,10 +282,57 @@ class FederationPlugin(_OtsPlugin):
             except Exception:  # pylint: disable=broad-except
                 pass
 
+        self.stop_engine_only(ots_logger)
+
+    def restart(self) -> dict:
+        """
+        Stop and respawn the engine child process so on-disk federation.ini
+        edits (peer add/edit/delete, global settings) take effect.
+
+        This is the same stop()/_spawn_engine() sequence the watchdog uses
+        on an unexpected exit, invoked on demand from the admin UI's
+        "Restart Engine" button (POST {API_PREFIX}/restart) rather than in
+        response to a crash. Does not re-run activate()'s config-seeding or
+        RabbitMQ-credential lookup — those don't change between edits — only
+        the parts that must re-read federation.ini: stop the old process,
+        spawn a new one against the same self._fed_cfg_path.
+
+        Returns {"success": True} or {"success": False, "error": "..."}.
+        """
+        try:
+            from opentakserver.extensions import logger as ots_logger
+        except ImportError:
+            import logging
+            ots_logger = logging.getLogger(__name__)
+
+        if self._fed_cfg_path is None or not os.path.exists(self._fed_cfg_path):
+            return {"success": False, "error": "federation.ini not found; nothing to restart"}
+
+        try:
+            self.stop_engine_only(ots_logger)
+            self._restart_count = 0  # operator-initiated restart resets the watchdog backoff
+            self._spawn_engine(ots_logger)
+            return {"success": True}
+        except Exception as exc:  # pylint: disable=broad-except
+            ots_logger.error("FederationPlugin: restart failed: %s", exc)
+            ots_logger.error(traceback.format_exc())
+            return {"success": False, "error": str(exc)}
+
+    def stop_engine_only(self, ots_logger=None) -> None:
+        """
+        Terminate the engine child process without cancelling the APScheduler
+        watchdog job (unlike stop(), which is the full OTS-lifecycle shutdown).
+        Shared by restart() so a manual restart doesn't have to re-register
+        the watchdog afterward.
+        """
+        if ots_logger is None:
+            import logging
+            ots_logger = logging.getLogger(__name__)
+
         if self._proc is None:
             return
 
-        ots_logger.info("FederationPlugin: stopping engine (pid=%d)", self._proc.pid)
+        ots_logger.info("FederationPlugin: stopping engine for restart (pid=%d)", self._proc.pid)
         try:
             self._proc.send_signal(signal.SIGTERM)
         except ProcessLookupError:
@@ -268,7 +341,6 @@ class FederationPlugin(_OtsPlugin):
 
         try:
             self._proc.wait(timeout=_STOP_WAIT_S)
-            ots_logger.info("FederationPlugin: engine exited cleanly")
         except subprocess.TimeoutExpired:
             ots_logger.warning(
                 "FederationPlugin: engine did not exit in %ds, sending SIGKILL",
@@ -301,6 +373,7 @@ class FederationPlugin(_OtsPlugin):
 
         return {
             "name": self.name,
+            "distro": self.distro,
             "pid": pid,
             "status": status,
             "uptime_secs": uptime_secs,
@@ -308,21 +381,34 @@ class FederationPlugin(_OtsPlugin):
         }
 
     def load_metadata(self) -> dict:
-        """Load package metadata from importlib.metadata (installed wheel)."""
+        """
+        Load package metadata from importlib.metadata (installed wheel).
+
+        Returns the full metadata dict (project_url, author_email, license,
+        summary, description, etc.) — not just name/distro/author/version —
+        because OTS core's own Plugin.tsx About tab reads several of these
+        fields directly, including `about.project_url.forEach(...)` with NO
+        null-check on project_url itself (only on `about`). A metadata dict
+        missing that key throws inside OTS core's own JS and blanks the
+        entire plugin detail page — including the UI iframe tab — before
+        anything of ours gets a chance to render. See pyproject.toml's
+        [project.urls] section, which is what populates it.
+        """
         try:
-            meta = importlib.metadata.metadata("ots-federation")
-            result = {
-                "name": meta.get("Name", "ots-federation"),
-                "distro": "ots-federation",
-                "author": meta.get("Author", ""),
-                "version": meta.get("Version", "0.0.0"),
-            }
+            meta = importlib.metadata.metadata(DISTRO)
+            result = dict(meta.json)
+            result["distro"] = DISTRO
+            result.setdefault("name", DISTRO)
+            result.setdefault("version", "0.0.0")
+            result.setdefault("author", meta.get("Author", ""))
+            result.setdefault("project_url", [])
         except importlib.metadata.PackageNotFoundError:
             result = {
-                "name": "ots-federation",
-                "distro": "ots-federation",
+                "name": DISTRO,
+                "distro": DISTRO,
                 "author": "",
                 "version": "dev",
+                "project_url": [],
             }
 
         self.name = result["name"]
@@ -430,51 +516,361 @@ class FederationPlugin(_OtsPlugin):
         except Exception as exc:  # pylint: disable=broad-except
             ots_logger.error("FederationPlugin: restart failed: %s", exc)
 
+    def _fed_cfg_path_or_404(self):
+        """Return self._fed_cfg_path, or a (jsonify, 404) tuple if unset/missing."""
+        fed_path = getattr(self, "_fed_cfg_path", None)
+        if not fed_path or not os.path.exists(fed_path):
+            return None, (jsonify({"success": False, "error": "federation.ini not found"}), 404)
+        return fed_path, None
+
     def _build_blueprint(self) -> None:
-        """Build and assign the federation REST blueprint."""
-        bp = Blueprint("federation_plugin", __name__, url_prefix="/api/federation")
+        """
+        Build and assign the plugin's Flask blueprint.
+
+        Routes live under API_PREFIX = /api/plugins/ots-federation, which is
+        the prefix OTS core's own web UI expects for every plugin (settings
+        tab fetch + plugin-UI iframe src both hit
+        /api/plugins/<distro>/{config,ui}). This replaces the earlier
+        /api/federation/* scaffold, which predated wiring up the OTS iframe
+        convention and was never a published/stable API — nothing outside
+        this plugin depended on that prefix.
+        """
+        from ots_federation import ini_writer
+
+        bp = Blueprint("federation_plugin", __name__, url_prefix=API_PREFIX)
+
+        # -- engine status -------------------------------------------------
 
         @bp.route("/status", methods=["GET"])
+        @_admin_only
         def status():
             return jsonify(self.get_info())
 
+        @bp.route("/restart", methods=["POST"])
+        @_admin_only
+        def restart_engine():
+            result = self.restart()
+            return jsonify(result), (200 if result.get("success") else 400)
+
+        # -- OTS plugin-framework config contract (Settings tab) ------------
+        # GET/POST here are unrelated to federation.ini — they read/write the
+        # app.config keys seeded from default_config.DefaultConfig (whether
+        # the plugin runs at all, where federation.ini lives, log level).
+        # OTS core's Plugin.tsx always renders this tab for every plugin.
+
         @bp.route("/config", methods=["GET"])
-        def config():
-            """Return parsed federation.ini without key material."""
-            import configparser as _cp
-            fed_path = getattr(self, "_fed_cfg_path", None)
-            if not fed_path or not os.path.exists(fed_path):
-                return jsonify({"error": "federation.ini not found"}), 404
+        @_admin_only
+        def get_plugin_config():
+            from ots_federation.default_config import DefaultConfig
+            return jsonify({key: self._app.config.get(key) for key in dir(DefaultConfig) if key.isupper()})
 
-            cfg = _cp.ConfigParser()
-            cfg.read(fed_path)
+        @bp.route("/config", methods=["POST"])
+        @_admin_only
+        def update_plugin_config():
+            from ots_federation.default_config import DefaultConfig
+            payload = request.get_json(silent=True) or {}
+            result = DefaultConfig.validate(payload)
+            if not result.get("success"):
+                return jsonify(result), 400
+            self._app.config.update(payload)
+            return jsonify(result)
 
-            safe = {}
-            for section in cfg.sections():
-                safe[section] = {}
-                for key, val in cfg.items(section):
-                    # Strip key material from the response.
-                    if any(k in key for k in ("key", "pass", "password", "secret")):
-                        safe[section][key] = "***"
-                    else:
-                        safe[section][key] = val
+        # -- federation.ini admin: global [federation]/[federation_ssl] -----
 
-            return jsonify(safe)
+        @bp.route("/peers", methods=["GET"])
+        @_admin_only
+        def list_peers():
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                return err
+            try:
+                return jsonify(ini_writer.read_all(fed_path))
+            except ini_writer.IniError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
 
-        @bp.route("/peer/<name>/enable", methods=["POST"])
+        @bp.route("/global", methods=["PUT"])
+        @_admin_only
+        def update_global():
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                return err
+            payload = request.get_json(silent=True) or {}
+            try:
+                ini_writer.update_global(
+                    fed_path, payload.get("global", {}), payload.get("ssl", {})
+                )
+                return jsonify({"success": True, **ini_writer.read_all(fed_path)})
+            except ini_writer.IniError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+
+        # -- federation.ini admin: per-peer [federate:<name>] ---------------
+
+        @bp.route("/peers", methods=["POST"])
+        @_admin_only
+        def create_peer():
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                return err
+            payload = request.get_json(silent=True) or {}
+            name = (payload.get("name") or "").strip()
+            if not name:
+                return jsonify({"success": False, "error": "'name' is required"}), 400
+            try:
+                ini_writer.upsert_peer(fed_path, name, payload, is_new=True)
+                return jsonify({"success": True, **ini_writer.read_all(fed_path)})
+            except ini_writer.IniError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+
+        @bp.route("/peers/<name>", methods=["PUT"])
+        @_admin_only
+        def edit_peer(name: str):
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                return err
+            payload = request.get_json(silent=True) or {}
+            try:
+                ini_writer.upsert_peer(fed_path, name, payload, is_new=False)
+                return jsonify({"success": True, **ini_writer.read_all(fed_path)})
+            except ini_writer.IniError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+
+        @bp.route("/peers/<name>", methods=["DELETE"])
+        @_admin_only
+        def remove_peer(name: str):
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                return err
+            try:
+                ini_writer.delete_peer(fed_path, name)
+                return jsonify({"success": True, **ini_writer.read_all(fed_path)})
+            except ini_writer.IniError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+
+        @bp.route("/peers/<name>/enable", methods=["POST"])
+        @_admin_only
         def peer_enable(name: str):
-            """Toggle a federation peer by name."""
-            data = request.get_json(silent=True) or {}
-            enabled = bool(data.get("enabled", True))
-            # Runtime peer toggling requires engine restart; return advisory.
-            return jsonify({
-                "peer": name,
-                "enabled": enabled,
-                "note": (
-                    "Peer state written to federation.ini requires engine restart "
-                    "to take effect.  Engine restart not yet implemented via REST; "
-                    "edit federation.ini and POST /api/plugins/federation/restart."
-                ),
-            })
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                return err
+            payload = request.get_json(silent=True) or {}
+            enabled = bool(payload.get("enabled", True))
+            try:
+                ini_writer.set_peer_enabled(fed_path, name, enabled)
+                return jsonify({"success": True, **ini_writer.read_all(fed_path)})
+            except ini_writer.IniError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+
+        # -- bundled Mantine/React UI (the OTS plugin-UI iframe convention) -
+        # Built by OTS-UI-Plugin-Template's `npm run build`, outDir pointed at
+        # ots_federation/ui/. See README's "Bundled plugin UI" section for the
+        # build instructions. OTS core's web UI embeds this at
+        # /api/plugins/ots-federation/ui inside an <iframe> on the plugin's
+        # page (OpenTAKServer-UI src/pages/Plugin.tsx). Server-rendered plain
+        # HTML — same convention as the CI-TRAP Reports plugin's admin page
+        # — rather than a built JS bundle: no npm build step, no CDN
+        # dependency, and no asset-serving path that can 404/mismatch.
+
+        from ots_federation import admin_ui
+
+        # flash() needs a secret key. OTS core always configures one via
+        # Flask-Security; this is a no-op there. Only relevant standalone
+        # (tests/dev) — never overwrite an existing key, that would
+        # invalidate live sessions.
+        if not self._app.config.get("SECRET_KEY"):
+            self._app.config["SECRET_KEY"] = os.urandom(32)
+
+        def _fed_cfg_path_for_ui() -> str:
+            """Always returns a path (unlike _fed_cfg_path_or_404), since the
+            admin page must render even before federation.ini exists — that's
+            the whole point of the 'generate' form."""
+            return self._fed_cfg_path or _get_default_fed_config_path(self._app)
+
+        @bp.route("/ui", methods=["GET"])
+        @_admin_only
+        def ui_index():
+            fed_path = _fed_cfg_path_for_ui()
+            data = ini_writer.read_all(fed_path)
+            return admin_ui.render_admin_page(
+                name=self.name,
+                version=self.metadata.get("version", "dev"),
+                status=self.get_info(),
+                data=data,
+                fed_cfg_path=fed_path,
+            )
+
+        @bp.route("/ui/restart", methods=["POST"])
+        @_admin_only
+        def ui_restart():
+            result = self.restart()
+            if result.get("success"):
+                admin_ui.flash("Engine restarted.", "success")
+            else:
+                admin_ui.flash(f"Restart failed: {result.get('error')}", "error")
+            return redirect(url_for("federation_plugin.ui_index"))
+
+        @bp.route("/ui/quickstart", methods=["POST"])
+        @_admin_only
+        def ui_quickstart():
+            fed_path = _fed_cfg_path_for_ui()
+            cert_dir = os.path.join(os.path.dirname(fed_path), "federation_certs")
+            argv = [
+                "--ini-path", fed_path,
+                "--cert-dir", cert_dir,
+                "--listen-port", request.form.get("listen_port", "9101"),
+                "--accept-as", request.form.get("accept_as", "*:__ANON__"),
+                "--share-as", request.form.get("share_as", "__ANON__:__ANON__"),
+            ]
+            if request.form.get("server_id"):
+                argv += ["--server-id", request.form["server_id"]]
+            if request.form.get("server_address"):
+                argv += ["--server-address", request.form["server_address"]]
+            if request.form.get("force"):
+                argv.append("--force")
+
+            proc = subprocess.run(
+                [sys.executable, "-m", "ots_federation.quickstart", *argv],
+                capture_output=True, text=True, timeout=60,
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+            if proc.returncode == 0:
+                admin_ui.flash(output or "Done.", "success")
+            else:
+                admin_ui.flash(output or f"quickstart exited {proc.returncode}", "error")
+            return redirect(url_for("federation_plugin.ui_index"))
+
+        @bp.route("/ui/export-bundle", methods=["POST"])
+        @_admin_only
+        def ui_export_bundle():
+            fed_path = _fed_cfg_path_for_ui()
+            cert_dir = os.path.join(os.path.dirname(fed_path), "federation_certs")
+            export_dir = os.path.join(cert_dir, "export-bundle")
+            proc = subprocess.run(
+                [
+                    sys.executable, "-m", "ots_federation.gen_fed_ca", "export",
+                    "--cert-dir", cert_dir, "--out-dir", export_dir, "--zip",
+                ],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                admin_ui.flash((proc.stdout or "") + (proc.stderr or ""), "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+
+            zip_path = export_dir.rstrip(os.sep) + ".zip"
+            if not os.path.exists(zip_path):
+                admin_ui.flash("Export ran but the zip wasn't found — check the cert-dir has "
+                                "output from a prior generate/quickstart.", "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+            return send_file(zip_path, as_attachment=True, download_name="federation-peer-bundle.zip")
+
+        @bp.route("/ui/global", methods=["POST"])
+        @_admin_only
+        def ui_global():
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                admin_ui.flash("federation.ini not found — generate it first.", "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+
+            global_data = admin_ui.form_to_data(request.form, ini_writer.GLOBAL_FIELDS)
+            ssl_data = admin_ui.form_to_data(request.form, ini_writer.SSL_FIELDS)
+            admin_ui.apply_secret_field(request.form, "fed_key_pw", ssl_data)
+
+            for key, dest_filename in (
+                ("fed_ca_bundle", "fed-ca.crt"),
+                ("fed_cert", "server-chain.crt"),
+                ("fed_key", "server.key"),
+            ):
+                saved = admin_ui.save_uploaded_cert(
+                    fed_path, request.files.get(f"{key}__file"), dest_filename,
+                    is_key=(key == "fed_key"),
+                )
+                if saved:
+                    ssl_data[key] = saved
+
+            try:
+                ini_writer.update_global(fed_path, global_data, ssl_data)
+                admin_ui.flash("Global settings saved. Restart the engine to apply.", "success")
+            except ini_writer.IniError as exc:
+                admin_ui.flash(f"Couldn't save: {exc}", "error")
+            return redirect(url_for("federation_plugin.ui_index"))
+
+        def _save_peer_from_form(fed_path: str, name: str, *, is_new: bool):
+            data = admin_ui.form_to_data(request.form, ini_writer.PEER_FIELDS)
+            admin_ui.apply_secret_field(request.form, "connection_token", data)
+            for key, dest_filename in (
+                ("ca_cert", "peer-ca.crt"),
+                ("client_cert", "client-chain.crt"),
+                ("client_key", "client.key"),
+            ):
+                saved = admin_ui.save_uploaded_cert(
+                    fed_path, request.files.get(f"{key}__file"), dest_filename,
+                    peer_name=name, is_key=(key == "client_key"),
+                )
+                if saved:
+                    data[key] = saved
+            ini_writer.upsert_peer(fed_path, name, data, is_new=is_new)
+
+        @bp.route("/ui/peers/new", methods=["POST"])
+        @_admin_only
+        def ui_peer_create():
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                admin_ui.flash("federation.ini not found — generate it first.", "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+            name = (request.form.get("name") or "").strip()
+            if not name:
+                admin_ui.flash("Peer name is required.", "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+            try:
+                _save_peer_from_form(fed_path, name, is_new=True)
+                admin_ui.flash(f"Peer '{name}' created. Restart the engine to apply.", "success")
+            except ini_writer.IniError as exc:
+                admin_ui.flash(f"Couldn't create peer: {exc}", "error")
+            return redirect(url_for("federation_plugin.ui_index"))
+
+        @bp.route("/ui/peers/<name>/edit", methods=["POST"])
+        @_admin_only
+        def ui_peer_edit(name: str):
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                admin_ui.flash("federation.ini not found.", "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+            try:
+                _save_peer_from_form(fed_path, name, is_new=False)
+                admin_ui.flash(f"Peer '{name}' saved. Restart the engine to apply.", "success")
+            except ini_writer.IniError as exc:
+                admin_ui.flash(f"Couldn't save peer: {exc}", "error")
+            return redirect(url_for("federation_plugin.ui_index"))
+
+        @bp.route("/ui/peers/<name>/toggle", methods=["POST"])
+        @_admin_only
+        def ui_peer_toggle(name: str):
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                admin_ui.flash("federation.ini not found.", "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+            enabled = request.form.get("enabled") == "1"
+            try:
+                ini_writer.set_peer_enabled(fed_path, name, enabled)
+                admin_ui.flash(
+                    f"Peer '{name}' {'enabled' if enabled else 'disabled'}. Restart the engine to apply.",
+                    "success",
+                )
+            except ini_writer.IniError as exc:
+                admin_ui.flash(f"Couldn't update peer: {exc}", "error")
+            return redirect(url_for("federation_plugin.ui_index"))
+
+        @bp.route("/ui/peers/<name>/delete", methods=["POST"])
+        @_admin_only
+        def ui_peer_delete(name: str):
+            fed_path, err = self._fed_cfg_path_or_404()
+            if err:
+                admin_ui.flash("federation.ini not found.", "error")
+                return redirect(url_for("federation_plugin.ui_index"))
+            try:
+                ini_writer.delete_peer(fed_path, name)
+                admin_ui.flash(f"Peer '{name}' deleted. Restart the engine to apply.", "success")
+            except ini_writer.IniError as exc:
+                admin_ui.flash(f"Couldn't delete peer: {exc}", "error")
+            return redirect(url_for("federation_plugin.ui_index"))
 
         self.blueprint = bp
