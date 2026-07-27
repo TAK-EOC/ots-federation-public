@@ -31,6 +31,10 @@ dependencies = [
     "pika>=1.3.0",
     # APScheduler for FederationPlugin watchdog job (plugin.py).
     "apscheduler>=3.10.0,<4.0",
+    # Comment-preserving INI read/write for the admin UI's federation.ini
+    # editor (ini_writer.py). Plain configparser would silently discard every
+    # hand-written comment in quickstart.py's generated file on the first save.
+    "configupdater>=3.2,<4.0",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +42,10 @@ dev = [
     "pytest>=8",
     "pytest-timeout",
 ]
+
+[project.urls]
+Repository = "https://github.com/TAK-EOC/ots-federation-public"
+Documentation = "https://github.com/TAK-EOC/ots-federation-public#readme"
 
 [project.entry-points."console_scripts"]
 # CLI tool for federation certificate generation (generate|export|apply
