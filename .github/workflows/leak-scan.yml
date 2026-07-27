@@ -1,0 +1,47 @@
+name: leak-scan
+
+# Fails the build if internal references or identity tells reach the public tree.
+# Server-side backstop to the local pre-push hook (which a --no-verify push skips).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan tracked files for internal references
+        run: |
+          set -euo pipefail
+          patterns=(
+            'ticket [0-9a-f]{6}'
+            'epic [0-9a-f]{6}'
+            '(Ticket|Epic):[[:space:]]*[0-9a-f]{6}'
+            'ADR[ -][0-9]{4}'
+            'ADR:'
+            '\bH-[123]\b'
+            '/home/noc'
+            '10\.86\.[0-9]'
+            '107\.173\.159|198\.144\.177|3\.230\.219'
+            'chucktaylor|rn-ca-rtr|rn-il-rtr|box2|aws-taky|field-test-01|taky-interop'
+            'gitlab\.com/26|joek_26|26xxx_vibecoding'
+            '@anthropic\.com|Co-Authored-By: Claude|claudepersonal'
+          )
+          # Exclude the scanner itself; it holds the patterns as literals.
+          files=$(git ls-files | grep -E '\.(py|md|qmd|toml|ini|cfg|txt|yml|yaml|sh|json|rs|go|java|kt)$' \
+                    | grep -vE '(^|/)\.github/' || true)
+          fail=0
+          for pat in "${patterns[@]}"; do
+            if hits=$(printf '%s\n' "$files" | xargs -r grep -nEi "$pat" 2>/dev/null); then
+              echo "BLOCKED pattern: $pat"
+              echo "$hits"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Internal references found in the public tree. Reword to generic rationale."
+            exit 1
+          fi
+          echo "Clean: no internal references found."
