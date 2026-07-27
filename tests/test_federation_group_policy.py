@@ -1,9 +1,9 @@
 # tests/test_federation_group_policy.py
-# Tests for the group-policy data path (epic 3e28a2).
-# Tickets covered:
-#   821114 — inbound map_inbound never called (ServerEventStream + ClientEventStream)
-#   a24bf4 — outbound map_outbound/federateGroups never set (prepare_outbound_event)
-#   d15a02 — FederateGroups streams were stubs (ClientFederateGroupsStream /
+# Tests for the group-policy data path.
+# Regression coverage for:
+#   inbound map_inbound never called (ServerEventStream + ClientEventStream)
+#   outbound map_outbound/federateGroups never set (prepare_outbound_event)
+#   FederateGroups streams were stubs (ClientFederateGroupsStream /
 #             ServerFederateGroupsStream / _drain_groups_stream / _open_client_groups_stream)
 # Test classes:
 #   TestOutboundGroupTagging  — prepare_outbound_event sets federateGroups + blocks
@@ -326,7 +326,7 @@ class TestInboundGroupFiltering(unittest.TestCase):
 
     def test_empty_federate_groups_blocked_without_wildcard(self):
         """Event with no federateGroups (stock TAK Server) is DROPPED when the
-        peer's accept_as names specific remote groups only (b39e05 fail-closed)."""
+        peer's accept_as names specific remote groups only (fail-closed)."""
         reg = _registry_with(PEER_ID, in_pairs={"Blue": "Blue"})
         client, bridge = self._make_client(reg)
         proto = self._make_proto_with_groups(remote_groups=[])
@@ -1253,9 +1253,9 @@ class TestCertFingerprintIdentityBinding(unittest.TestCase):
         NEGATIVE assertion: a certificate whose fingerprint has NO entry in
         the registry's fingerprint table is quarantined even when a
         permissive global default (accept_as=*:__ANON__ equivalent) is
-        configured -- it must NEVER inherit that default. This is the H-1
-        exploit surface: an unconfigured certificate must get nothing, not
-        the most permissive available policy.
+        configured -- it must NEVER inherit that default. This is the
+        fail-open exploit surface: an unconfigured certificate must get
+        nothing, not the most permissive available policy.
         """
         reg = FederateGroupRegistry()
         from ots_federation.groups import parse_group_map
@@ -1301,8 +1301,9 @@ class TestCertFingerprintIdentityBinding(unittest.TestCase):
         self.assertTrue(quarantined)
 
     # --- NEGATIVE (b): unconfigured fingerprint, but serverId MATCHES a real
-    #     peer -- must still quarantine. This is the exact H-1 escalation:
-    #     asserting a configured peer's identity string on an unrelated cert.
+    #     peer -- must still quarantine. This is the exact fail-open
+    #     escalation: asserting a configured peer's identity string on an
+    #     unrelated cert.
 
     def test_unconfigured_fingerprint_claiming_a_real_peers_server_id_is_quarantined(self):
         """

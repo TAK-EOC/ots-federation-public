@@ -1,7 +1,5 @@
 # tests/test_inbound_delivery.py
-# Unit tests for Option D inbound delivery (epic 1c88b3).
-# Tickets: (46a007) (86fa14)
-# ADR: 0004 §Option-D-forks-resolved
+# Unit tests for Option D inbound delivery (the "forks resolved" design).
 # Architecture: .qmd §4
 # Coverage:
 #   I1  — inject with local_groups → publishes to groups exchange per group

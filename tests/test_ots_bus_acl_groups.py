@@ -1,6 +1,5 @@
 # tests/test_ots_bus_acl_groups.py
 # Unit tests for Option D outbound ACL-group sourcing (//).
-# Tickets: (ad6034) (aa9b62) (b9d6b0); epic 1c88b3.
 # All pika interactions are mocked; no live RabbitMQ required.
 # Coverage:
 #   B1  — _on_groups_message: .OUT routing key → cache.update called

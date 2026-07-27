@@ -1,6 +1,6 @@
 # tests/test_federation_loopback.py
 # Bidirectional loopback integration test for the INBOUND federation server
-# side (epic 3e28a2 Phase 3).
+# side (federation hardening work, phase 3).
 # Adapted from taky test_federation_loopback.py (taky-federation branch, commit e12a2af).
 # Changes vs. taky original:
 #   - Removed COTRouter + taky.config / taky.cot dependencies.
@@ -18,7 +18,7 @@
 # Throwaway CA + server + client certs are generated in a tmp dir via
 # gen_fed_ca's generate_ca / generate_peer_cert helpers.  They are NEVER
 # committed (tmp dir, removed in tearDown).
-# Asserts (epic 3e28a2 Phase 3 acceptance):
+# Asserts (phase 3 acceptance):
 #   (1) Client → Server: a CoT event injected at the FederateClient is received
 #       by the SERVER's bus (delivered locally, bus.events non-empty).
 #   (2) Server → Client: an event originating on the SERVER reaches the
@@ -297,8 +297,8 @@ class FederationLoopbackTest(unittest.TestCase):
         Uses a TAKUser/White event to satisfy the outbound group policy on the
         server side.  The server is configured with default_group_map_out=
         'White:White' (setUp) so White-group events flow to inbound clients.
-        After the ticket-46f6dd fix, events with no determinable group are
-        suppressed — a bare geo event without <__group> would be blocked.
+        Events with no determinable group are now suppressed -- a bare geo
+        event without <__group> would be blocked.
         """
         from lxml import etree  # pylint: disable=import-outside-toplevel
 

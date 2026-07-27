@@ -5,10 +5,9 @@
 # federated events into OTS via the cot_parser exchange. Also provides the
 # firehose consumer that picks up local OTS events and routes them through
 # manager.on_outbound to federation peers.
-# Ticket: 2fd76c (bridge module)
 # Research: .qmd §5
 #           .qmd §3
-# Option D additions (tickets 3d5216/ad6034/aa9b62, epic 1c88b3):
+# Option D additions (group-ACL policy and inbound-delivery work):
 #   - EudGroupCache: thread-safe uid→ACL-groups cache (eud_group_cache.py).
 #   - Groups exchange subscriber : dedicated pika connection consuming
 #     the OTS 'groups' topic exchange with '#' binding; populates the cache.
@@ -211,7 +210,7 @@ class OtsRmqBus:
         # heartbeat=0 disables the server-side enforcement; TCP keepalives handle
         # liveness on the loopback connection.  The subscribe connections are not
         # affected — they call process_data_events(time_limit=1.0) in a tight
-        # loop which drives the heartbeat I/O path normally.  Ticket: 3fc530.
+        # loop which drives the heartbeat I/O path normally.
         pub_params = pika.ConnectionParameters(
             host=self._host,
             port=self._port,
@@ -289,7 +288,7 @@ class OtsRmqBus:
 
             creds = pika.PlainCredentials(self._user, self._password)
             # heartbeat=0 here for the same reason as in connect(): the publish
-            # connection is idle between inject() calls.  Ticket: 3fc530.
+            # connection is idle between inject() calls.
             pub_params = pika.ConnectionParameters(
                 host=self._host,
                 port=self._port,

@@ -1,5 +1,5 @@
 # tests/test_federation_hardening.py
-# Ported from taky tests/test_federation_hardening.py (commit 1fd9d2f) into
+# Ported from taky tests/test_federation_hardening.py into
 # ots_federation plugin namespace..
 # Adaptations vs. taky original:
 #   - All taky.* imports → ots_federation.*
@@ -8,18 +8,18 @@
 #     when constructing the dataclass directly; only enforced in _parse_peer_section)
 #   - _minimal_fed_ini includes display_name in [federate:alpha] (required)
 #   - allow_federated_delete DEFAULT conflict documented below:
-#       taky-fed 716e46 default: False (secure conservative)
-#       plugin 069ed8 default: True  (matches CoreConfig allowFederatedDelete spec)
+#       taky-fed default: False (secure conservative)
+#       plugin default: True  (matches CoreConfig allowFederatedDelete spec)
 #     Tests that assert the config-level default are adapted to assert True;
 #     the guard behaviour tests use explicit kwarg and are unaffected.
-# Tests for taky-fed hardening batch (epic 3e28a2):
-#   b475e9 — health_check_interval default 60s → 10s
-#   a6fe4b — TakServerVersion populated in outbound Subscription
-#   744aad — display_name + fallback_when_no_group_mappings config
-#   716e46 — allow_federated_delete config + inbound DELETE guard
-#   b3b7e2 — ROL frame logging passthrough
-#   875e80 — per-group hop limit enforcement
-#   956a23 — ContactListEntry wired to LocalBus / OTS
+# Tests for the taky-fed hardening batch:
+#   health_check_interval default 60s -> 10s
+#   TakServerVersion populated in outbound Subscription
+#   display_name + fallback_when_no_group_mappings config
+#   allow_federated_delete config + inbound DELETE guard
+#   ROL frame logging passthrough
+#   per-group hop limit enforcement
+#   ContactListEntry wired to LocalBus / OTS
 
 import configparser
 import io
@@ -226,7 +226,7 @@ class TestTakServerVersionInSubscription(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestDisplayNameConfig(unittest.TestCase):
-    """display_name in [federate:<name>] surfaces in outgoing Identity. 744aad.
+    """display_name in [federate:<name>] surfaces in outgoing Identity.
 
     Note: unlike taky-fed where display_name is optional (fallback to node_id)
     the plugin treats display_name as REQUIRED (ConfigError if absent in INI).
@@ -291,7 +291,7 @@ class TestDisplayNameConfig(unittest.TestCase):
 
 
 class TestFallbackWhenNoGroupMappings(unittest.TestCase):
-    """fallback_when_no_group_mappings wires to registry.set_fallback_allow. 744aad."""
+    """fallback_when_no_group_mappings wires to registry.set_fallback_allow."""
 
     def test_default_is_false(self):
         peer = _make_peer_config()
@@ -331,9 +331,9 @@ class TestFallbackWhenNoGroupMappings(unittest.TestCase):
 class TestAllowFederatedDeleteConfig(unittest.TestCase):
     """allow_federated_delete config and guard..
 
-    DEFAULT CONFLICT (b18c63):
-      taky-fed 716e46:  default=False (secure conservative, matches TAK Server std)
-      plugin 069ed8:    default=True  (matches CoreConfig allowFederatedDelete spec)
+    DEFAULT CONFLICT:
+      taky-fed:  default=False (secure conservative, matches TAK Server std)
+      plugin:    default=True  (matches CoreConfig allowFederatedDelete spec)
 
     Plugin keeps default=True per parity work. The guard logic is fully
     implemented; operators must explicitly set allow_federated_delete=False in
@@ -363,7 +363,7 @@ class TestAllowFederatedDeleteConfig(unittest.TestCase):
 
 
 class TestFederatedDeleteInboundGuard(unittest.TestCase):
-    """Inbound DELETE events dropped when allow_federated_delete=False. 716e46."""
+    """Inbound DELETE events dropped when allow_federated_delete=False."""
 
     def _make_client(self, allow_delete=False):
         from ots_federation.client import FederateClient
@@ -426,7 +426,7 @@ class TestFederatedDeleteInboundGuard(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestROLFrameLogging(unittest.TestCase):
-    """ServerROLStream logs program at INFO and optionally writes to sink. b3b7e2."""
+    """ServerROLStream logs program at INFO and optionally writes to sink."""
 
     def _make_servicer(self, sink_path=""):
         from ots_federation.fed_server import FederatedChannelServicer
@@ -613,7 +613,7 @@ class TestPerGroupHopLimits(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestContactListEntrySynthesis(unittest.TestCase):
-    """synthesize_contact_event generates CoT events from ContactListEntry. 956a23."""
+    """synthesize_contact_event generates CoT events from ContactListEntry."""
 
     def _make_contact(self, op, uid="contact-uid-1", callsign="Alpha"):
         return fig_pb2.ContactListEntry(
@@ -693,7 +693,7 @@ class TestContactListEntrySynthesis(unittest.TestCase):
 
 
 class TestContactListEntryInboundRouting(unittest.TestCase):
-    """FederateClient._handle_inbound routes ContactListEntry events via bridge. 956a23.
+    """FederateClient._handle_inbound routes ContactListEntry events via bridge.
 
     In the plugin, synthesized contact CoT events are injected via
     bridge.enqueue → LocalBus → OTS, the same path as regular inbound events.

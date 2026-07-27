@@ -227,7 +227,7 @@ class TestPublishConnectionHeartbeat(unittest.TestCase):
     pika.BlockingConnection does not process heartbeats while idle between
     inject() calls (PLI events arrive every 5-8 min in the field). Without
     heartbeat=0, RabbitMQ kills the connection on its 60s heartbeat deadline
-    before the next inject() fires.  Ticket: 3fc530.
+    before the next inject() fires.
 
     Mocking strategy: patch pika.BlockingConnection in the ots_bus module so
     we can capture the ConnectionParameters passed to each call.  The first

@@ -17,8 +17,6 @@
 #   APScheduler job 'federation_watchdog' runs every 30s.
 #   If child has died, restart up to MAX_RESTART_COUNT times.
 #   After that many restarts, log an error and stop trying (operator action needed).
-# Ticket: e3fbe5 (plugin scaffold)
-# Epic:   1c88b3
 
 from __future__ import annotations
 

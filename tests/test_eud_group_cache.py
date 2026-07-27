@@ -1,5 +1,5 @@
 # tests/test_eud_group_cache.py
-# Unit tests for EudGroupCache (epic 1c88b3).
+# Unit tests for EudGroupCache.
 # Coverage:
 #   C1  — cache miss → None (unknown uid)
 #   C2  — single-group hit (update then get)

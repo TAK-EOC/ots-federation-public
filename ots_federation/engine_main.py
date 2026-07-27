@@ -9,8 +9,6 @@
 #   OTS_RMQUSER  — RabbitMQ username (default: guest)
 #   OTS_RMQPASS  — RabbitMQ password
 # NEVER pass credentials via CLI args — they would be visible in ps output.
-# Ticket: 2fd76c (bridge module)
-# Epic:   1c88b3
 # Threading model:
 #   Main thread  : pika firehose consumer (OtsRmqBus.start_consuming loop)
 #   Daemon threads per peer : gRPC side-threads (managed by FederationManager)
@@ -200,7 +198,7 @@ def main(argv=None):
     else:
         log.warning(
             "OTS_FED_DBURI not set — cache miss stays fail-closed (no synchronous "
-            "group resolution); federation may drop events on cold cache (169438)"
+            "group resolution); federation may drop events on cold cache"
         )
 
     bus = OtsRmqBus(

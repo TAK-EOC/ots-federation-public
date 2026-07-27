@@ -549,7 +549,7 @@ def _resolve_by_value(name: str):
     """
     Look up a Teams member whose .value matches ``name`` (case-sensitive).
 
-    Dead code since Phase-1 string migration (ebd62f): map_inbound no longer
+    Dead code since the Phase-1 string migration: map_inbound no longer
     calls this — the fallback-allow path now returns the remote group string
     directly. Kept for backward-compat with test imports. Scheduled for removal
     in a later cleanup ticket.
@@ -578,7 +578,7 @@ def parse_group_map(raw: str, direction: Literal["in", "out", "both"]) -> List[F
       - Empty right side means BLOCK.
       - ``*`` on the left is a wildcard catch-all.
 
-    Phase-1 string migration (ebd62f): both sides now accept arbitrary strings.
+    Phase-1 string migration: both sides now accept arbitrary strings.
     ATAK color names ("White", "Blue", etc.) continue to work as before. Arbitrary
     names like "FIRE-OPS" are now also valid without raising ValueError.
 

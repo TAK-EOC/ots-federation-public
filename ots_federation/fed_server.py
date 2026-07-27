@@ -1,5 +1,5 @@
 # taky/cot/federation/fed_server.py
-# Stream: transport (INBOUND server side — epic 3e28a2 Phase 3)
+# Stream: transport (INBOUND server side — federation hardening work, phase 3)
 #                         real ATAK device)
 #/ §5 (loop prevention + hop stamp — shared helper)
 #(federation TLS trust, separate from ATAK [ssl]).
@@ -381,7 +381,7 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
         return fig_pb2.ServerHealth(status=fig_pb2.ServerHealth.ServingStatus.SERVING)
 
     # ------------------------------------------------------------------
-    # FederateGroups streams.(d15a02).
+    # FederateGroups streams.
     # ------------------------------------------------------------------
     def ClientFederateGroupsStream(self, request_iterator, context):  # noqa: N802
         """
@@ -515,7 +515,7 @@ class FederatedChannelServicer(fig_pb2_grpc.FederatedChannelServicer):
             )
             if evt is not None:
                 # Apply inbound group policy (same as ServerEventStream).
-                # Group-less events consult the wildcard policy too (b39e05).
+                # Group-less events consult the wildcard policy too.
                 # A quarantined identity never reaches the registry (see
                 # ServerEventStream's comment on the same gate).
                 if self.group_registry is not None:

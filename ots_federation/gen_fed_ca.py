@@ -546,8 +546,9 @@ federation CA certificate (public) and filled-in config templates.
    - Stock TAK Server: paste `takserver-federate-stanza.xml` inside your
      CoreConfig.xml `<federation>` element. **The `<inboundGroup>` /
      `<outboundGroup>` children are REQUIRED** — a `<federate>` entry without
-     them exchanges nothing in either direction (this is what broke ticket
-     2a74dd; do not strip them). The `id` attribute is already filled in as
+     them exchanges nothing in either direction (dropping them silently
+     breaks federation in both directions; do not strip them). The `id`
+     attribute is already filled in as
      the SHA-256 fingerprint of the leaf certificate we present during the
      handshake (`{fingerprint}`) — TAK Server's FIG negotiator uses it to
      match our inbound connection to this entry.
