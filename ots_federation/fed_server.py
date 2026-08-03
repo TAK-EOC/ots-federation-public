@@ -772,10 +772,12 @@ class FederationServer:
         group_registry=None,
         allow_federated_delete=False,
         rol_log_sink="",
+        insecure_listen=False,
     ):
         self.listen_ip = listen_ip
         self.listen_port = listen_port
         self.server_credentials = server_credentials
+        self.insecure_listen = insecure_listen
         self.max_workers = max_workers
         self.lgr = logging.getLogger("FederationServer")
 
@@ -827,11 +829,21 @@ class FederationServer:
                 address, self.server_credentials
             )
             self.lgr.info("FederationServer listening (mTLS) on %s", address)
-        else:
-            self._bound_port = self._server.add_insecure_port(address)
-            self.lgr.warning(
-                "FederationServer listening INSECURE on %s (testing only — no mTLS)",
+        elif self.insecure_listen:
+            self.lgr.error(
+                "FederationServer listening WITHOUT TLS on %s by explicit "
+                "insecure_listen opt-in — peers are UNAUTHENTICATED and "
+                "certificate identity binding cannot apply",
                 address,
+            )
+            self._bound_port = self._server.add_insecure_port(address)
+        else:
+            # Enforced here as well as in FederationManager so the guarantee
+            # holds for any caller that builds a server directly.
+            raise ValueError(
+                "FederationServer requires mTLS credentials. Pass "
+                "server_credentials, or set insecure_listen=True to bind a "
+                "plaintext, unauthenticated federation port deliberately."
             )
 
         if self._bound_port == 0:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ots-federation"
-version = "0.1.22"
+version = "0.1.23"
 description = "TAK federation v2 plugin for OpenTAKServer (FIG v2 gRPC, mutual-TLS, group-based access control)"
 readme = "README.md"
 authors = [{name = "takeoc", email = "takeoc@proton.me"}]

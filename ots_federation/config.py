@@ -263,6 +263,13 @@ class FederationConfig:
     listen_enabled: bool = False
     listen_ip: str = "0.0.0.0"
     listen_port: int = 9101
+    # Run the inbound listener with NO TLS and NO client-cert verification.
+    # The only way to get a plaintext federation listener: incomplete cert
+    # material aborts startup instead. Named so an operator cannot enable it
+    # without saying what they are turning off. Note that without a peer
+    # certificate there is nothing for identity binding to bind to, so group
+    # policy falls back to the wire-supplied candidate path.
+    insecure_listen: bool = False
     default_group_map_in: str = ""
     default_group_map_out: str = ""
     peers: List[FederatePeerConfig] = field(default_factory=list)
@@ -559,6 +566,9 @@ def get_federation_config(app_cfg: configparser.ConfigParser) -> FederationConfi
     # Inbound listener (taky↔taky server side). Disabled by default so existing
     # outbound-only deployments are byte-identical.
     listen_enabled = _get_bool(app_cfg, "federation", "listen_enabled", fallback=False)
+    insecure_listen = _get_bool(
+        app_cfg, "federation", "insecure_listen", fallback=False
+    )
     listen_ip = _get_str(app_cfg, "federation", "listen_ip", fallback="0.0.0.0")
     listen_port = _get_int(app_cfg, "federation", "listen_port", fallback=9101)
 
@@ -610,6 +620,7 @@ def get_federation_config(app_cfg: configparser.ConfigParser) -> FederationConfi
         listen_enabled=listen_enabled,
         listen_ip=listen_ip,
         listen_port=listen_port,
+        insecure_listen=insecure_listen,
         default_group_map_in=default_group_map_in,
         default_group_map_out=default_group_map_out,
         peers=peers,

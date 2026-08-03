@@ -426,10 +426,31 @@ class FederationManager:
                 fed_key_password=key_pw,
                 require_client_auth=True,
             )
+        elif getattr(self.config, "insecure_listen", False):
+            self.lgr.error(
+                "Federation inbound listener starting WITHOUT TLS on %s:%s by "
+                "explicit [federation] insecure_listen opt-in — peers are "
+                "UNAUTHENTICATED and traffic is in the clear",
+                self.config.listen_ip, self.config.listen_port,
+            )
         else:
-            self.lgr.warning(
-                "Federation listen enabled but [federation_ssl] cert material is "
-                "incomplete; starting INSECURE inbound server (testing only)"
+            missing = [
+                name
+                for name, value in (
+                    ("fed_ca_bundle", ssl_cfg.fed_ca_bundle),
+                    ("fed_cert", ssl_cfg.fed_cert),
+                    ("fed_key", ssl_cfg.fed_key),
+                )
+                if not value
+            ]
+            raise ValueError(
+                "[federation] listen_enabled is true but [federation_ssl] is "
+                f"missing {', '.join(missing)}. An inbound federation listener "
+                "without mTLS is unauthenticated, and identity binding has "
+                "nothing to bind to — every connection resolves through the "
+                "legacy wire-supplied candidate path. Supply the cert material, "
+                "or set [federation] insecure_listen = true to accept plaintext "
+                "federation deliberately."
             )
 
         self._fed_server = FederationServer(
@@ -444,6 +465,7 @@ class FederationManager:
             group_registry=self.group_registry,
             allow_federated_delete=getattr(self.config, "allow_federated_delete", False),
             rol_log_sink=getattr(self.config, "rol_log_sink", ""),
+            insecure_listen=getattr(self.config, "insecure_listen", False),
             max_workers=getattr(self.config, "grpc_max_workers", 64),
         )
         bound = self._fed_server.start()
