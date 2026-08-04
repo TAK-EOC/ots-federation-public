@@ -1,0 +1,108 @@
+# Clean-room acceptance spec — see tools/shipcheck.py in the workspace root.
+#
+# The unit of acceptance here is the federation ENGINE, not the plugin class.
+# The plugin is a thin supervisor that OpenTAKServer loads and which then spawns
+# `python -m ots_federation.engine_main` as a child process; that child holds
+# the gRPC transport, the peer connections and the listener, so that is what has
+# to be proven to start.
+#
+# The engine connects to RabbitMQ BEFORE it starts the federation manager, so
+# there is no honest way to reach a listening state without a broker. A
+# throwaway container supplies one. Asserting only "it got as far as RabbitMQ"
+# would be checking that the daemon reaches a stack trace, not a running state.
+
+name = "ots-federation (OpenTAKServer federation engine)"
+
+# Necessary, not sufficient. grpc is listed explicitly because an artifact that
+# imports but cannot federate is the exact failure this standard exists for.
+imports = [
+    "ots_federation",
+    "ots_federation.engine_main",
+    "ots_federation.cert_identity",
+    "grpc",
+    "pika",
+    "opentakserver",
+]
+
+[[entrypoints]]
+cmd = ["ots-fed-certs", "--help"]
+
+[[entrypoints]]
+cmd = ["ots-federation-quickstart", "--help"]
+
+# The engine's firehose consumer is a hard requirement for startup.
+[[depends]]
+name = "rabbitmq"
+image = "rabbitmq:3-alpine"
+port = 5672
+ready_timeout = 180
+env = { RABBITMQ_DEFAULT_USER = "guest", RABBITMQ_DEFAULT_PASS = "guest" }
+# Docker's proxy accepts a connection the instant the port mapping exists, so a
+# port probe hands the engine a socket that then fails the AMQP handshake. Wait
+# for the broker to say it is up. (rabbitmq-diagnostics is unreliable in the
+# alpine image; the log line is definitive and image-agnostic.)
+ready_log = "Server startup complete"
+
+[service]
+config_name = "federation.ini"
+module = "ots_federation.engine_main"
+cmd = ["--config", "{workdir}/federation.ini"]
+start_timeout = 120
+stop_timeout = 30
+
+# Credentials arrive by environment, never on the command line — the engine is
+# explicit that CLI args would expose them in ps output.
+env = { OTS_RMQHOST = "{dep_rabbitmq_host}", OTS_RMQPORT = "{dep_rabbitmq_port}", OTS_RMQUSER = "guest", OTS_RMQPASS = "guest", OTS_FED_LOG_LEVEL = "INFO" }
+
+# Federation on, listener on, bound to the port shipcheck probes. No TLS
+# material is supplied, so this also asserts the fail-closed listener has a
+# working named escape hatch: without insecure_listen the engine is expected to
+# refuse to start.
+config = """
+[federation]
+enabled = true
+server_id = shipcheck-ots
+server_name = shipcheck
+listen_enabled = true
+listen_ip = 127.0.0.1
+listen_port = {port}
+insecure_listen = true
+accept_as = *:__ANON__
+share_as = __ANON__:__ANON__
+"""
+
+# The engine must reach a running federation state, not merely parse its config.
+log_must_contain = [
+    "OTS federation engine starting",
+    "FederationServer listening",
+]
+
+# A startup that logs a traceback is not a startup, even if the port opens.
+log_must_not_contain = [
+    "Traceback \\(most recent call last\\)",
+    "ModuleNotFoundError",
+    "CryptographyDeprecationWarning",
+]
+
+# NOTE: sub-tables must come after every plain key above — TOML assigns bare
+# keys to the most recently opened table.
+#
+# The engine binds to exchanges OpenTAKServer owns and declares; it does not
+# create them itself and refuses to start when they are absent. A bare broker is
+# therefore not the environment this artifact ships into. Declaring them models
+# the OTS-provisioned broker and nothing more — it does no work the engine is
+# supposed to do, so a broken engine still fails.
+[[service.setup]]
+name = "declare the exchanges OpenTAKServer owns"
+python = """
+import pika
+params = pika.ConnectionParameters(
+    host='{dep_rabbitmq_host}', port={dep_rabbitmq_port},
+    credentials=pika.PlainCredentials('guest', 'guest'))
+conn = pika.BlockingConnection(params)
+ch = conn.channel()
+for name in ('firehose', 'groups', 'cot_parser', 'dms'):
+    ch.exchange_declare(exchange=name, exchange_type='fanout', durable=True)
+conn.close()
+print('declared')
+"""
