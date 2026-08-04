@@ -28,7 +28,14 @@ import sys
 import time
 import traceback
 
-from flask import Blueprint, Flask, jsonify, request
+from flask import Blueprint, Flask, jsonify
+
+# Auth guards for the federation REST blueprint.  Provided by the host OTS app
+# (opentakserver depends on flask-security-too), same as `flask` above — no
+# separate declaration in pyproject.toml.  These endpoints expose federation
+# topology and peer state, so they are administrator-only, matching the
+# decorator stack OTS uses on its own admin routes.
+from flask_security import auth_required, roles_accepted
 
 # Conditionally inherit from OTS Plugin base class.
 # When ots-federation is installed inside the OTS venv, this import succeeds
@@ -433,10 +440,14 @@ class FederationPlugin(_OtsPlugin):
         bp = Blueprint("federation_plugin", __name__, url_prefix="/api/federation")
 
         @bp.route("/status", methods=["GET"])
+        @auth_required()
+        @roles_accepted("administrator")
         def status():
             return jsonify(self.get_info())
 
         @bp.route("/config", methods=["GET"])
+        @auth_required()
+        @roles_accepted("administrator")
         def config():
             """Return parsed federation.ini without key material."""
             import configparser as _cp
@@ -459,20 +470,13 @@ class FederationPlugin(_OtsPlugin):
 
             return jsonify(safe)
 
-        @bp.route("/peer/<name>/enable", methods=["POST"])
-        def peer_enable(name: str):
-            """Toggle a federation peer by name."""
-            data = request.get_json(silent=True) or {}
-            enabled = bool(data.get("enabled", True))
-            # Runtime peer toggling requires engine restart; return advisory.
-            return jsonify({
-                "peer": name,
-                "enabled": enabled,
-                "note": (
-                    "Peer state written to federation.ini requires engine restart "
-                    "to take effect.  Engine restart not yet implemented via REST; "
-                    "edit federation.ini and POST /api/plugins/federation/restart."
-                ),
-            })
+        # NOTE: there is deliberately no per-peer enable/disable route here.
+        # The official Federation Hub has no such endpoint — `outgoingEnabled`
+        # is a property of the policy document, applied live by the broker
+        # (FederationHubBrokerService.updateOutgoingConnections).  Our engine
+        # reads [federate:*] enabled once at startup and cannot re-apply peer
+        # state without a restart, so a REST toggle here could only ever be
+        # advisory.  If live enable/disable is wanted, build it engine-side to
+        # match the hub's semantics rather than reintroducing a no-op route.
 
         self.blueprint = bp
